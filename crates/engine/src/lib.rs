@@ -343,7 +343,7 @@ impl Engine {
     pub fn list_belts(&self) -> anyhow::Result<Vec<Belt>> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
-            "SELECT id, a_id, b_id, kind, created_at_ms, updated_at_ms, rev
+            "SELECT id, a_id, b_id, kind, path_json, created_at_ms, updated_at_ms, rev
              FROM belts
              ORDER BY updated_at_ms DESC",
         )?;
@@ -353,23 +353,30 @@ impl Engine {
                 a_id: row.get(1)?,
                 b_id: row.get(2)?,
                 kind: row.get(3)?,
-                created_at_ms: row.get(4)?,
-                updated_at_ms: row.get(5)?,
-                rev: row.get(6)?,
+                path_json: row.get(4)?,
+                created_at_ms: row.get(5)?,
+                updated_at_ms: row.get(6)?,
+                rev: row.get(7)?,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn create_belt(&self, a_id: &str, b_id: &str, kind: &str) -> anyhow::Result<Belt> {
+    pub fn create_belt(
+        &self,
+        a_id: &str,
+        b_id: &str,
+        kind: &str,
+        path_json: &str,
+    ) -> anyhow::Result<Belt> {
         let mut conn = self.open()?;
         let tx = conn.transaction()?;
         let id = new_id("belt");
         let ts = now_ms();
         tx.execute(
-            "INSERT INTO belts (id, a_id, b_id, kind, created_at_ms, updated_at_ms, rev)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
-            (&id, a_id, b_id, kind, ts),
+            "INSERT INTO belts (id, a_id, b_id, kind, path_json, created_at_ms, updated_at_ms, rev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)",
+            (&id, a_id, b_id, kind, path_json, ts),
         )?;
         append_event_tx(
             &tx,
@@ -383,6 +390,7 @@ impl Engine {
             a_id: a_id.to_string(),
             b_id: b_id.to_string(),
             kind: kind.to_string(),
+            path_json: path_json.to_string(),
             created_at_ms: ts,
             updated_at_ms: ts,
             rev: 1,
@@ -458,6 +466,7 @@ pub struct Belt {
     pub a_id: String,
     pub b_id: String,
     pub kind: String,
+    pub path_json: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub rev: i64,
@@ -567,15 +576,16 @@ CREATE TABLE IF NOT EXISTS steps (
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS belts (
-  id TEXT PRIMARY KEY,
-  a_id TEXT NOT NULL,
-  b_id TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'link',
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  rev INTEGER NOT NULL DEFAULT 0
-);
+	CREATE TABLE IF NOT EXISTS belts (
+	  id TEXT PRIMARY KEY,
+	  a_id TEXT NOT NULL,
+	  b_id TEXT NOT NULL,
+	  kind TEXT NOT NULL DEFAULT 'link',
+	  path_json TEXT NOT NULL DEFAULT '[]',
+	  created_at_ms INTEGER NOT NULL,
+	  updated_at_ms INTEGER NOT NULL,
+	  rev INTEGER NOT NULL DEFAULT 0
+	);
 CREATE INDEX IF NOT EXISTS idx_belts_updated_at ON belts(updated_at_ms);
 CREATE INDEX IF NOT EXISTS idx_belts_a_id ON belts(a_id);
 CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
@@ -617,6 +627,7 @@ CREATE TABLE IF NOT EXISTS belts (
   a_id TEXT NOT NULL,
   b_id TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'link',
+  path_json TEXT NOT NULL DEFAULT '[]',
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
   rev INTEGER NOT NULL DEFAULT 0
@@ -627,6 +638,8 @@ CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
 "#,
     )?;
 
+    ensure_column(conn, "belts", "path_json", "TEXT NOT NULL DEFAULT '[]'")?;
+
     // Backfill footprints for early dev DBs that stored everything as 1x1.
     // Only touch rows that still look like defaults.
     conn.execute_batch(
@@ -635,6 +648,19 @@ UPDATE entities SET w=9, h=9 WHERE kind='base' AND w=1 AND h=1;
 UPDATE entities SET w=3, h=4 WHERE kind IN ('feature','research','warehouse','university','library','power') AND w=1 AND h=1;
 "#,
     )?;
+
+    // Force bases to the current canonical footprint (9x9) so hitboxes match visuals.
+    // This also bumps the event_log rev so connected UIs will refresh.
+    let changed = conn.execute(
+        "UPDATE entities SET w=9, h=9 WHERE kind='base' AND (w < 9 OR h < 9)",
+        [],
+    )?;
+    if changed > 0 {
+        conn.execute(
+            "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, ?2, NULL, ?3)",
+            (now_ms(), "entities.base_footprint", "{}"),
+        )?;
+    }
 
     Ok(())
 }

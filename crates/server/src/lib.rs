@@ -181,10 +181,20 @@ async fn api_entities_create(
         .engine
         .list_entities()
         .map_err(internal_error("engine.list_entities"))?;
+    let belts = state
+        .engine
+        .list_belts()
+        .map_err(internal_error("engine.list_belts"))?;
 
     let fp = (spec.w, spec.h);
     if overlaps_any(&entities, input.x, input.y, fp.0, fp.1) {
         return Err((axum::http::StatusCode::CONFLICT, "overlap".to_string()));
+    }
+    if overlaps_any_belt(&belts, input.x, input.y, fp.0, fp.1) {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "overlap_belt".to_string(),
+        ));
     }
 
     let mut payload = serde_json::json!({});
@@ -200,13 +210,39 @@ async fn api_entities_create(
         }
         payload["repo_path"] = serde_json::Value::String(repo_path.to_string());
     } else {
-        let Some(base_id) = nearest_base_id(&entities, input.x, input.y, fp.0, fp.1, 9) else {
+        let Some(base_id) = nearest_base_id(&entities, input.x, input.y, fp.0, fp.1, 12) else {
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
                 "requires_base".to_string(),
             ));
         };
         payload["base_id"] = serde_json::Value::String(base_id);
+    }
+
+    // University connects only to a library (not directly to base), so disallow it unless a library exists.
+    if input.kind == "university" {
+        let base_id = payload
+            .get("base_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let has_library = entities.iter().any(|e| {
+            if e.kind != "library" {
+                return false;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(&e.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+            v.get("base_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == base_id)
+                .unwrap_or(false)
+        });
+        if !has_library {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "university_requires_library".to_string(),
+            ));
+        }
     }
 
     let ent = state
@@ -262,6 +298,10 @@ async fn api_entities_update_pos(
         .engine
         .list_entities()
         .map_err(internal_error("engine.list_entities"))?;
+    let belts = state
+        .engine
+        .list_belts()
+        .map_err(internal_error("engine.list_belts"))?;
     let Some(cur) = entities.iter().find(|e| e.id == id).cloned() else {
         return Err((axum::http::StatusCode::NOT_FOUND, "not_found".to_string()));
     };
@@ -270,8 +310,11 @@ async fn api_entities_update_pos(
     if overlaps_any(&others, input.x, input.y, fp.0, fp.1) {
         return Err((axum::http::StatusCode::CONFLICT, "overlap".to_string()));
     }
+    if overlaps_any_belt(&belts, input.x, input.y, fp.0, fp.1) {
+        return Err((axum::http::StatusCode::CONFLICT, "overlap_belt".to_string()));
+    }
     if cur.kind != "base" {
-        if nearest_base_id(&others, input.x, input.y, fp.0, fp.1, 9).is_none() {
+        if nearest_base_id(&others, input.x, input.y, fp.0, fp.1, 12).is_none() {
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
                 "requires_base".to_string(),
@@ -429,9 +472,25 @@ async fn api_belts_create(
         return Err((axum::http::StatusCode::BAD_REQUEST, "a_id and b_id required".to_string()));
     }
     let kind = input.kind.as_deref().unwrap_or("link");
+    // Compute a path so belts actually occupy space.
+    let ents = state
+        .engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    let a = ents.iter().find(|e| e.id == a_id).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "a_id_not_found".to_string(),
+    ))?;
+    let b = ents.iter().find(|e| e.id == b_id).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "b_id_not_found".to_string(),
+    ))?;
+    let path = belt_path_cells(&ents, a, b);
+    let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string());
+
     let belt = state
         .engine
-        .create_belt(a_id, b_id, kind)
+        .create_belt(a_id, b_id, kind, &path_json)
         .map_err(internal_error("engine.create_belt"))?;
     Ok(Json(belt))
 }
@@ -733,7 +792,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "B".to_string(),
             copy: "Main command hub. Place first to anchor routing and runtime links.".to_string(),
             preview: "/rts-sprites/thumb-base.webp".to_string(),
-            sprite: "/rts-sprites/base_sprite-20260212a.webp".to_string(),
+            sprite: "/rts-sprites/base_sprite-20260217b.webp".to_string(),
             w: 9,
             h: 9,
         },
@@ -744,7 +803,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Creates feature runs. Link a base repo, draft stories, and launch agents."
                 .to_string(),
             preview: "/rts-sprites/thumb-feature.webp".to_string(),
-            sprite: "/rts-sprites/feature_factory_sprite.webp".to_string(),
+            sprite: "/rts-sprites/feature_factory_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -755,7 +814,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Scans repos and generates plan cards. Drag plans to seed feature drafts."
                 .to_string(),
             preview: "/rts-sprites/thumb-research.webp".to_string(),
-            sprite: "/rts-sprites/research_lab_sprite.webp".to_string(),
+            sprite: "/rts-sprites/research_lab_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -765,7 +824,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "W".to_string(),
             copy: "Stores completed artifacts and links them back to base logistics.".to_string(),
             preview: "/rts-sprites/thumb-warehouse.webp".to_string(),
-            sprite: "/rts-sprites/warehouse_sprite.webp".to_string(),
+            sprite: "/rts-sprites/warehouse_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -776,7 +835,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Advanced planning campus. Uses Research Lab mechanics with a distinct skin."
                 .to_string(),
             preview: "/rts-sprites/thumb-university.webp".to_string(),
-            sprite: "/rts-sprites/university_sprite-20260212a.webp".to_string(),
+            sprite: "/rts-sprites/university_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -786,7 +845,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "Y".to_string(),
             copy: "Knowledge vault. Uses Warehouse mechanics with a distinct skin.".to_string(),
             preview: "/rts-sprites/thumb-library.webp".to_string(),
-            sprite: "/rts-sprites/library_sprite-20260212a.webp".to_string(),
+            sprite: "/rts-sprites/library_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -796,7 +855,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "P".to_string(),
             copy: "Cron station. Uses Library placement and shows active jobs.".to_string(),
             preview: "/rts-sprites/thumb-power.webp".to_string(),
-            sprite: "/rts-sprites/power_sprite-20260212a.webp".to_string(),
+            sprite: "/rts-sprites/power_sprite-20260217b.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -807,6 +866,18 @@ fn overlaps_any(ents: &[Entity], x: i64, y: i64, w: i64, h: i64) -> bool {
     for e in ents {
         if rects_overlap(x, y, w, h, e.x, e.y, e.w, e.h) {
             return true;
+        }
+    }
+    false
+}
+
+fn overlaps_any_belt(belts: &[Belt], x: i64, y: i64, w: i64, h: i64) -> bool {
+    for b in belts {
+        let cells: Vec<BeltCell> = serde_json::from_str(&b.path_json).unwrap_or_default();
+        for c in cells {
+            if rects_overlap(x, y, w, h, c.x, c.y, 1, 1) {
+                return true;
+            }
         }
     }
     false
@@ -886,6 +957,7 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
 
     let add = |seen: &mut std::collections::HashSet<(String, String)>,
                engine: &Engine,
+               entities: &[Entity],
                a: &str,
                b: &str,
                kind: &str| {
@@ -896,7 +968,11 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
         if seen.contains(&key) {
             return;
         }
-        if engine.create_belt(a, b, kind).is_ok() {
+        let Some(ae) = entities.iter().find(|e| e.id == a) else { return; };
+        let Some(be) = entities.iter().find(|e| e.id == b) else { return; };
+        let path = belt_path_cells(entities, ae, be);
+        let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string());
+        if engine.create_belt(a, b, kind, &path_json).is_ok() {
             seen.insert(key);
         }
     };
@@ -914,8 +990,8 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
     };
 
     // Default: connect most buildings to base.
-    if matches!(kind, "research" | "library" | "power" | "university") {
-        add(&mut seen, engine, &base.id, &ent.id, "link");
+    if matches!(kind, "research" | "library" | "power") {
+        add(&mut seen, engine, &entities, &base.id, &ent.id, "link");
     }
 
     if kind == "warehouse" {
@@ -931,17 +1007,17 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
             if best.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
                 best = Some((cand, d));
             }
-        }
-        if let Some((lab, _)) = best {
-            add(&mut seen, engine, &lab.id, &ent.id, "link");
-        } else {
-            add(&mut seen, engine, &base.id, &ent.id, "link");
-        }
-    }
+	        }
+	        if let Some((lab, _)) = best {
+	            add(&mut seen, engine, &entities, &lab.id, &ent.id, "link");
+	        } else {
+	            add(&mut seen, engine, &entities, &base.id, &ent.id, "link");
+	        }
+	    }
 
     if kind == "feature" {
         // Factories connect to base and (if present) the nearest warehouse.
-        add(&mut seen, engine, &base.id, &ent.id, "link");
+        add(&mut seen, engine, &entities, &base.id, &ent.id, "link");
         let (ex, ey) = entity_center(ent);
         let mut best_wh: Option<(&Entity, f64)> = None;
         for wh in entities.iter().filter(|e| e.kind == "warehouse") {
@@ -955,7 +1031,7 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
             }
         }
         if let Some((wh, _)) = best_wh {
-            add(&mut seen, engine, &wh.id, &ent.id, "link");
+            add(&mut seen, engine, &entities, &wh.id, &ent.id, "link");
         }
     }
 
@@ -975,7 +1051,7 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
                 }
             }
             if let Some((lib, _)) = best_lib {
-                add(&mut seen, engine, &ent.id, &lib.id, "link");
+                add(&mut seen, engine, &entities, &ent.id, &lib.id, "link");
             }
         } else {
             let mut best_uni: Option<(&Entity, f64)> = None;
@@ -990,12 +1066,96 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
                 }
             }
             if let Some((uni, _)) = best_uni {
-                add(&mut seen, engine, &uni.id, &ent.id, "link");
+                add(&mut seen, engine, &entities, &uni.id, &ent.id, "link");
             }
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BeltCell {
+    x: i64,
+    y: i64,
+}
+
+fn belt_anchor_cell(ent: &Entity) -> (i64, i64) {
+    let cx = ent.x + (ent.w / 2);
+    let cy = ent.y + ent.h;
+    (cx, cy)
+}
+
+fn rect_contains(ent: &Entity, x: i64, y: i64) -> bool {
+    x >= ent.x && y >= ent.y && x < (ent.x + ent.w) && y < (ent.y + ent.h)
+}
+
+fn belt_path_cells(ents: &[Entity], a: &Entity, b: &Entity) -> Vec<BeltCell> {
+    let (sx, sy) = belt_anchor_cell(a);
+    let (ex, ey) = belt_anchor_cell(b);
+
+    let mut path1: Vec<(i64, i64)> = vec![];
+    let mut x = sx;
+    let mut y = sy;
+    // x then y
+    while x != ex {
+        path1.push((x, y));
+        x += if ex > x { 1 } else { -1 };
+    }
+    while y != ey {
+        path1.push((x, y));
+        y += if ey > y { 1 } else { -1 };
+    }
+    path1.push((ex, ey));
+
+    let mut path2: Vec<(i64, i64)> = vec![];
+    let mut x = sx;
+    let mut y = sy;
+    // y then x
+    while y != ey {
+        path2.push((x, y));
+        y += if ey > y { 1 } else { -1 };
+    }
+    while x != ex {
+        path2.push((x, y));
+        x += if ex > x { 1 } else { -1 };
+    }
+    path2.push((ex, ey));
+
+    let score = |p: &[(i64, i64)]| -> i64 {
+        let mut bad = 0;
+        for (x, y) in p.iter().copied() {
+            // Don't count occupancy inside endpoints.
+            if rect_contains(a, x, y) || rect_contains(b, x, y) {
+                continue;
+            }
+            for e in ents {
+                if e.id == a.id || e.id == b.id {
+                    continue;
+                }
+                if rect_contains(e, x, y) {
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+        bad
+    };
+    let s1 = score(&path1);
+    let s2 = score(&path2);
+    let best = if s1 <= s2 { path1 } else { path2 };
+
+    let mut out: Vec<BeltCell> = vec![];
+    let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    for (x, y) in best {
+        if rect_contains(a, x, y) || rect_contains(b, x, y) {
+            continue;
+        }
+        if seen.insert((x, y)) {
+            out.push(BeltCell { x, y });
+        }
+    }
+    out
 }
 
 pub async fn serve(addr: SocketAddr, db_path: PathBuf) -> anyhow::Result<()> {
@@ -1015,6 +1175,10 @@ pub async fn serve_listener(
     let state = AppState {
         engine: Engine::new(db_path),
     };
+    // Best-effort DB repair: backfill belt paths so belts can occupy tiles even for older rows.
+    if let Err(_e) = repair_belt_paths(&state.engine) {
+        // Belts are derivable; never fail startup on this.
+    }
     let app = build_router(state);
     let addr = listener.local_addr()?;
     axum::serve(
@@ -1024,6 +1188,41 @@ pub async fn serve_listener(
     .with_graceful_shutdown(shutdown)
     .await?;
     Ok(addr)
+}
+
+fn repair_belt_paths(engine: &Engine) -> anyhow::Result<()> {
+    let ents = engine.list_entities()?;
+    let belts = engine.list_belts().unwrap_or_default();
+    if belts.is_empty() {
+        return Ok(());
+    }
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    for b in belts {
+        let raw = b.path_json.trim();
+        if raw != "[]" && !raw.is_empty() {
+            continue;
+        }
+        let Some(a) = ents.iter().find(|e| e.id == b.a_id) else { continue; };
+        let Some(c) = ents.iter().find(|e| e.id == b.b_id) else { continue; };
+        let path = belt_path_cells(&ents, a, c);
+        let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string());
+        tx.execute(
+            "UPDATE belts SET path_json=?1, updated_at_ms=?2, rev=rev+1 WHERE id=?3",
+            (&path_json, now, &b.id),
+        )?;
+        tx.execute(
+            "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            (now, "belt.repaired", &b.id, "{}"),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 async fn ip_allowlist(
@@ -1267,6 +1466,12 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .dock.is-hidden{display:none}
     .dock h2{font-family:Orbitron,system-ui,sans-serif;font-size:13px;letter-spacing:.6px;margin-bottom:10px}
     .dock .scroll{height:100%;overflow:auto;padding-right:6px}
+    /* Custom scrollbar (desktop) for the questbook only. */
+    .dock .scroll::-webkit-scrollbar{width:10px}
+    .dock .scroll::-webkit-scrollbar-track{background:#040b16;border:1px solid #1b3a57}
+    .dock .scroll::-webkit-scrollbar-thumb{background:#0e2a43;border:1px solid #3a7aa3}
+    .dock .scroll::-webkit-scrollbar-thumb:hover{background:#123652}
+    .dock .scroll{scrollbar-color:#3a7aa3 #040b16; scrollbar-width:thin;}
     .card{
       border:1px solid #5fa5d655;border-radius:0;
       background:linear-gradient(160deg,#0c223bdd 0%, #081427dd 100%);
@@ -1299,6 +1504,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }
     .commandbar.detail{grid-template-columns: 1fr;}
     .commandbar.detail .palette-wrap{display:none;}
+    .commandbar.idle{grid-template-columns: 1fr;}
+    .commandbar.idle .bottompanel{display:none;}
     .palette-wrap{
       display:flex;
       flex-direction:column;
@@ -1307,19 +1514,22 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       height:100%;
     }
     .palette{
-      display:flex;
+      display:grid;
+      grid-auto-flow:row;
+      grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
+      grid-auto-rows:1fr;
       gap:10px;
       overflow:hidden;
-      padding:2px;
+      padding:6px;
       border-radius:0;
-      border:1px solid #4f799f55;
+      border:0;
       background:#061325aa;
       height:100%;
       align-items:stretch;
-      flex-wrap:wrap;
+      align-content:stretch;
     }
     .palette-card{
-      width:220px;
+      width:auto;
       height:100%;
       flex:0 0 auto;
       border-radius:0;
@@ -1534,6 +1744,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    let pendingBasePlacement = null;
 	    let belts = [];
 	    let selectedBeltId = null;
+	    let beltOcc = new Set(); // "x,y" occupied by belt segments (1x1 cells)
 
 	    function showBaseModal(show){
 	      if (!baseCreateModalEl) return;
@@ -1917,8 +2128,25 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	      const a = placed.find((p) => p.id === bt.a_id);
 	      const b = placed.find((p) => p.id === bt.b_id);
 	      if (!a || !b) return null;
-	      const pts = beltPolylineWorld(a, b);
-	      return pts.map((p) => worldToScreen(p.x, p.y));
+	      // Prefer server-provided occupied cells so visuals match placement blocking.
+	      let cells = [];
+	      try{ cells = JSON.parse(bt.path_json || "[]"); }catch(_e){ cells = []; }
+	      const ptsWorld = [];
+	      if (Array.isArray(cells) && cells.length){
+	        const pa = beltEndpointWorld(a);
+	        ptsWorld.push(pa);
+	        for (const c of cells){
+	          const x = Number(c && c.x);
+	          const y = Number(c && c.y);
+	          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+	          ptsWorld.push({ x: x + 0.5, y: y + 0.5 });
+	        }
+	        const pb = beltEndpointWorld(b);
+	        ptsWorld.push(pb);
+	      } else {
+	        ptsWorld.push(...beltPolylineWorld(a, b));
+	      }
+	      return ptsWorld.map((p) => worldToScreen(p.x, p.y));
 	    }
 
 	    function pointSegDist(px, py, ax, ay, bx, by){
@@ -1954,21 +2182,56 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	      return null;
 	    }
 
-	    function canPlace(kind, x, y){
-	      const fp = footprintFor(kind);
-	      // Non-base buildings must connect to an existing base.
+		    function canPlace(kind, x, y){
+		      const fp = footprintFor(kind);
+		      // Non-base buildings must connect to an existing base.
 		      if (kind !== "base"){
 		        if (!nearAnyBase(x, y, fp.w, fp.h, 12)) return false;
 		      }
-	      for (let dy = 0; dy < fp.h; dy++){
-	        for (let dx = 0; dx < fp.w; dx++){
-	          const cx = x + dx;
-	          const cy = y + dy;
-	          if (hitTestCell(cx, cy)) return false;
-	        }
-	      }
-	      return true;
-	    }
+		      // Belts occupy tiles; cannot build over them.
+		      for (let dy = 0; dy < fp.h; dy++){
+		        for (let dx = 0; dx < fp.w; dx++){
+		          const cx = x + dx;
+		          const cy = y + dy;
+		          if (beltOcc && beltOcc.has(`${cx},${cy}`)) return false;
+		        }
+		      }
+		      // University requires a library (same base) to connect to.
+		      if (kind === "university"){
+		        const base = nearestBaseForPlacement(x, y, fp.w, fp.h);
+		        if (!base) return false;
+		        let ok = false;
+		        for (const e of placed){
+		          if (!e || e.kind !== "library") continue;
+		          const p = jsonParse(e.payload_json);
+		          if (String(p.base_id || "") === String(base.id || "")){ ok = true; break; }
+		        }
+		        if (!ok) return false;
+		      }
+		      for (let dy = 0; dy < fp.h; dy++){
+		        for (let dx = 0; dx < fp.w; dx++){
+		          const cx = x + dx;
+		          const cy = y + dy;
+		          if (hitTestCell(cx, cy)) return false;
+		        }
+		      }
+		      return true;
+		    }
+
+		    function nearestBaseForPlacement(x, y, w, h){
+		      let best = null;
+		      let bestD = Infinity;
+		      const aL = x, aT = y, aR = x + w, aB = y + h;
+		      for (const e of placed){
+		        if (!e || e.kind !== "base") continue;
+		        const bL = e.x, bT = e.y, bR = e.x + (e.w || 1), bB = e.y + (e.h || 1);
+		        const dx = dist1d(aL, aR, bL, bR);
+		        const dy = dist1d(aT, aB, bT, bB);
+		        const d = Math.max(dx, dy);
+		        if (d < bestD){ bestD = d; best = e; }
+		      }
+		      return best;
+		    }
 
 	    function loadImage(src){
 	      if (spriteCache.has(src)) return spriteCache.get(src);
@@ -2054,10 +2317,10 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       return await r.json();
     }
 
-	    function applyState(st){
-	      if (!st || typeof st !== "object") return;
-	      lastRev = Number(st.rev || 0);
-	      const ents = Array.isArray(st.entities) ? st.entities : [];
+		    function applyState(st){
+		      if (!st || typeof st !== "object") return;
+		      lastRev = Number(st.rev || 0);
+		      const ents = Array.isArray(st.entities) ? st.entities : [];
       placed = ents.map((e) => ({
         id: String(e.id),
         kind: String(e.kind),
@@ -2070,12 +2333,25 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	      if (selected){
 	        selected = placed.find((p) => p.id === selected.id) || null;
 	      }
-	      belts = Array.isArray(st.belts) ? st.belts.map((b) => ({
-	        id: String(b.id),
-	        a_id: String(b.a_id),
-	        b_id: String(b.b_id),
-	        kind: String(b.kind || "link"),
-	      })) : [];
+		      belts = Array.isArray(st.belts) ? st.belts.map((b) => ({
+		        id: String(b.id),
+		        a_id: String(b.a_id),
+		        b_id: String(b.b_id),
+		        kind: String(b.kind || "link"),
+		        path_json: String(b.path_json || "[]"),
+		      })) : [];
+		      beltOcc = new Set();
+		      for (const bt of belts){
+		        let cells = [];
+		        try{ cells = JSON.parse(bt.path_json || "[]"); }catch(_e){ cells = []; }
+		        if (!Array.isArray(cells)) continue;
+		        for (const c of cells){
+		          const x = Number(c && c.x);
+		          const y = Number(c && c.y);
+		          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+		          beltOcc.add(`${x},${y}`);
+		        }
+		      }
 	      // Keep multi-selection stable across refreshes.
 	      const alive = new Set(placed.map((p) => p.id));
 	      const nextSel = new Set();
@@ -2707,6 +2983,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       if (!bottomPanel) return;
       const hasDetail = !!selected || !!selectedBeltId;
       if (commandbarEl) commandbarEl.classList.toggle("detail", hasDetail);
+      if (commandbarEl) commandbarEl.classList.toggle("idle", !hasDetail);
       if (!selected && !selectedBeltId){
         bottomPanel.innerHTML = "";
         return;
