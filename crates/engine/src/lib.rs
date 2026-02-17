@@ -21,7 +21,8 @@ impl Engine {
     pub fn open(&self) -> anyhow::Result<Connection> {
         let path = self.db_path.clone();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("create db dir: {}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create db dir: {}", dir.display()))?;
         }
 
         let conn = Connection::open_with_flags(
@@ -78,4 +79,3 @@ CREATE TABLE IF NOT EXISTS steps (
     )?;
     Ok(())
 }
-
