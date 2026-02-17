@@ -4,6 +4,7 @@ members = [
   "crates/protocol",
   "crates/engine",
   "crates/server",
-  "src-tauri",
 ]
 
+# Keep the Tauri app (`src-tauri`) out of the default workspace build so
+# headless `cargo test` works on machines without WebKit/GTK system deps.
