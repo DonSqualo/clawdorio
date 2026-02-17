@@ -609,6 +609,24 @@ CREATE INDEX IF NOT EXISTS idx_quests_updated_at ON quests(updated_at_ms);
 "#,
     )?;
 
+    // Belts table might be missing in older dev DBs; keep it self-healing.
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS belts (
+  id TEXT PRIMARY KEY,
+  a_id TEXT NOT NULL,
+  b_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'link',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_belts_updated_at ON belts(updated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_belts_a_id ON belts(a_id);
+CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
+"#,
+    )?;
+
     // Backfill footprints for early dev DBs that stored everything as 1x1.
     // Only touch rows that still look like defaults.
     conn.execute_batch(
