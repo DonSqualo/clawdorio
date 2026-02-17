@@ -8,8 +8,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use clawdorio_engine::{Engine, Entity};
-use clawdorio_protocol::{targets, Patch, Swap, UiUpdate};
+use clawdorio_engine::{Engine, Entity, Quest};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -46,8 +45,10 @@ pub fn build_router(state: AppState) -> Router {
             get(api_entities_list).post(api_entities_create),
         )
         .route("/api/entities/{id}", delete(api_entities_delete))
+        .route("/api/quests", get(api_quests_list).post(api_quests_upsert))
+        .route("/api/quests/{id}", delete(api_quests_delete))
+        .route("/api/runs", get(api_runs_list))
         .route("/api/feature/build", post(api_feature_build))
-        .route("/api/ui/demo", post(ui_demo))
         .nest_service("/rts-sprites", sprites)
         .with_state(Arc::new(state))
         // Local security: allow only loopback + Tailscale by default.
@@ -69,7 +70,9 @@ async fn dashboard() -> Html<&'static str> {
 #[derive(Debug, Clone, Serialize)]
 struct ApiState {
     rev: i64,
+    working_agents: i64,
     entities: Vec<Entity>,
+    quests: Vec<Quest>,
 }
 
 async fn api_state(
@@ -79,11 +82,24 @@ async fn api_state(
         .engine
         .get_rev()
         .map_err(internal_error("engine.get_rev"))?;
+    let working_agents = state
+        .engine
+        .count_working_agents()
+        .map_err(internal_error("engine.count_working_agents"))?;
     let entities = state
         .engine
         .list_entities()
         .map_err(internal_error("engine.list_entities"))?;
-    Ok(Json(ApiState { rev, entities }))
+    let quests = state
+        .engine
+        .list_quests()
+        .map_err(internal_error("engine.list_quests"))?;
+    Ok(Json(ApiState {
+        rev,
+        working_agents,
+        entities,
+        quests,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,6 +110,8 @@ struct BuildingSpec {
     copy: String,
     preview: String,
     sprite: String,
+    w: i64,
+    h: i64,
 }
 
 async fn api_buildings() -> Json<Vec<BuildingSpec>> {
@@ -121,15 +139,16 @@ async fn api_entities_create(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(input): Json<CreateEntityInput>,
 ) -> Result<Json<Entity>, (axum::http::StatusCode, String)> {
-    if !building_specs().iter().any(|b| b.kind == input.kind) {
+    let specs = building_specs();
+    let Some(spec) = specs.iter().find(|b| b.kind == input.kind) else {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "unknown building kind".to_string(),
         ));
-    }
+    };
     let ent = state
         .engine
-        .create_entity(&input.kind, input.x, input.y)
+        .create_entity(&input.kind, input.x, input.y, spec.w, spec.h)
         .map_err(internal_error("engine.create_entity"))?;
     Ok(Json(ent))
 }
@@ -143,6 +162,118 @@ async fn api_entities_delete(
         .delete_entity(&id)
         .map_err(internal_error("engine.delete_entity"))?;
     Ok(Json(serde_json::json!({ "ok": true, "deleted": deleted })))
+}
+
+async fn api_quests_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<Vec<Quest>>, (axum::http::StatusCode, String)> {
+    let quests = state
+        .engine
+        .list_quests()
+        .map_err(internal_error("engine.list_quests"))?;
+    Ok(Json(quests))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertQuestInput {
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+async fn api_quests_upsert(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<UpsertQuestInput>,
+) -> Result<Json<Quest>, (axum::http::StatusCode, String)> {
+    let title = input.title.trim();
+    if title.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "title is required".to_string(),
+        ));
+    }
+    let kind = input.kind.as_deref().unwrap_or("human");
+    let st = input.state.as_deref().unwrap_or("open");
+    let body = input.body.as_deref().unwrap_or("");
+    let quest = state
+        .engine
+        .upsert_quest(input.id.as_deref(), title, kind, st, body)
+        .map_err(internal_error("engine.upsert_quest"))?;
+    Ok(Json(quest))
+}
+
+async fn api_quests_delete(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let deleted = state
+        .engine
+        .delete_quest(&id)
+        .map_err(internal_error("engine.delete_quest"))?;
+    Ok(Json(serde_json::json!({ "ok": true, "deleted": deleted })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RunsQuery {
+    #[serde(default)]
+    entity_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunRow {
+    id: String,
+    status: String,
+    task: String,
+    created_at: String,
+}
+
+async fn api_runs_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<RunsQuery>,
+) -> Result<Json<Vec<RunRow>>, (axum::http::StatusCode, String)> {
+    let Some(entity_id) = q.entity_id else {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "entity_id is required".to_string(),
+        ));
+    };
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status, task, created_at
+             FROM runs
+             WHERE entity_id = ?1
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.prepare_runs: {e}"),
+            )
+        })?;
+    let rows = stmt
+        .query_map([entity_id], |row| {
+            Ok(RunRow {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                task: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query_runs: {e}"),
+            )
+        })?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,9 +314,9 @@ async fn api_feature_build(
     .to_string();
 
     tx.execute(
-        "INSERT INTO runs (id, workflow_id, task, status, context_json, created_at, updated_at)
-         VALUES (?1, 'feature', ?2, 'running', ?3, ?4, ?4)",
-        (&run_id, &task, &ctx, &ts),
+        "INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at)
+         VALUES (?1, 'feature', ?2, 'running', ?3, ?4, ?5, ?5)",
+        (&run_id, &task, &input.entity_id, &ctx, &ts),
     )
     .map_err(|e| {
         (
@@ -240,6 +371,8 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Main command hub. Place first to anchor routing and runtime links.".to_string(),
             preview: "/rts-sprites/thumb-base.webp".to_string(),
             sprite: "/rts-sprites/base_sprite-20260212a.webp".to_string(),
+            w: 4,
+            h: 4,
         },
         BuildingSpec {
             kind: "feature".to_string(),
@@ -249,6 +382,8 @@ fn building_specs() -> Vec<BuildingSpec> {
                 .to_string(),
             preview: "/rts-sprites/thumb-feature.webp".to_string(),
             sprite: "/rts-sprites/feature_factory_sprite.webp".to_string(),
+            w: 3,
+            h: 4,
         },
         BuildingSpec {
             kind: "research".to_string(),
@@ -258,6 +393,8 @@ fn building_specs() -> Vec<BuildingSpec> {
                 .to_string(),
             preview: "/rts-sprites/thumb-research.webp".to_string(),
             sprite: "/rts-sprites/research_lab_sprite.webp".to_string(),
+            w: 3,
+            h: 4,
         },
         BuildingSpec {
             kind: "warehouse".to_string(),
@@ -266,6 +403,8 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Stores completed artifacts and links them back to base logistics.".to_string(),
             preview: "/rts-sprites/thumb-warehouse.webp".to_string(),
             sprite: "/rts-sprites/warehouse_sprite.webp".to_string(),
+            w: 3,
+            h: 4,
         },
         BuildingSpec {
             kind: "university".to_string(),
@@ -275,6 +414,8 @@ fn building_specs() -> Vec<BuildingSpec> {
                 .to_string(),
             preview: "/rts-sprites/thumb-university.webp".to_string(),
             sprite: "/rts-sprites/university_sprite-20260212a.webp".to_string(),
+            w: 3,
+            h: 4,
         },
         BuildingSpec {
             kind: "library".to_string(),
@@ -283,6 +424,8 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Knowledge vault. Uses Warehouse mechanics with a distinct skin.".to_string(),
             preview: "/rts-sprites/thumb-library.webp".to_string(),
             sprite: "/rts-sprites/library_sprite-20260212a.webp".to_string(),
+            w: 3,
+            h: 4,
         },
         BuildingSpec {
             kind: "power".to_string(),
@@ -291,47 +434,10 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Cron station. Uses Library placement and shows active jobs.".to_string(),
             preview: "/rts-sprites/thumb-power.webp".to_string(),
             sprite: "/rts-sprites/power_sprite-20260212a.webp".to_string(),
+            w: 3,
+            h: 4,
         },
     ]
-}
-
-#[derive(Debug, Deserialize)]
-struct DemoInput {
-    #[serde(default)]
-    pub selected: Option<String>,
-}
-
-async fn ui_demo(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Json(input): Json<DemoInput>,
-) -> Json<UiUpdate> {
-    // Touch engine so the process fails fast if sqlite is unavailable.
-    let _ = state.engine.open();
-
-    let selected = input.selected.unwrap_or_else(|| "none".to_string());
-    let patches = vec![
-        Patch {
-            target: targets::PANEL_BOTTOM_BAR.to_string(),
-            swap: Swap::Replace,
-            html: Some(format!(
-                "<div class=\"card\"><strong>Bottom Bar</strong><div>Selected: {}</div></div>",
-                html_escape::encode_text(&selected)
-            )),
-            payload: None,
-            trigger: None,
-        },
-        Patch {
-            target: targets::PANEL_RIGHT.to_string(),
-            swap: Swap::Replace,
-            html: Some(
-                "<div class=\"card\"><strong>Right Panel</strong><div>Demo patch ok.</div></div>"
-                    .to_string(),
-            ),
-            payload: None,
-            trigger: None,
-        },
-    ];
-    Json(UiUpdate::new("ui.demo", patches))
 }
 
 pub async fn serve(addr: SocketAddr, db_path: PathBuf) -> anyhow::Result<()> {
@@ -454,7 +560,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       --ok:#4df5bf;
       --warn:#ffd06b;
       --bad:#ff7198;
-      --dock-w:min(300px, 26vw);
+      --dock-w:min(340px, 26vw);
+      --top-h:36px;
       --command-h:200px;
       --screen-pad:12px;
     }
@@ -472,22 +579,15 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .layout{position:relative;width:100vw;height:100vh}
     .topbar{
       position:absolute;left:var(--screen-pad);right:var(--screen-pad);top:var(--screen-pad);
-      height:54px;display:flex;gap:12px;align-items:center;justify-content:space-between;
-      padding:10px 12px;border:1px solid var(--panel-edge);border-radius:0;
+      height:var(--top-h);display:flex;gap:12px;align-items:center;justify-content:flex-start;
+      padding:6px 10px;border:1px solid var(--panel-edge);border-radius:0;
       background:linear-gradient(160deg,#0c223b 0%, #081427 100%);
       box-shadow:0 12px 30px #020c1888;
       z-index:50;
     }
-    .brand{display:flex;align-items:center;gap:10px}
-    .sig{
-      width:10px;height:10px;border-radius:0;background:linear-gradient(160deg,var(--teal),var(--blue));
-      box-shadow:0 0 0 3px #6ff8ff22;
-    }
-    .brand h1{font-family:Orbitron,system-ui,sans-serif;font-size:14px;letter-spacing:.7px}
-    .brand .sub{font-size:11px;color:var(--muted)}
-    .pill{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-    .dot{width:8px;height:8px;border-radius:0;background:var(--warn);box-shadow:0 0 0 3px #ffd06b22}
-    .dot.ok{background:var(--ok);box-shadow:0 0 0 3px #4df5bf22}
+    .resources{display:flex;align-items:baseline;gap:10px}
+    .reslabel{font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace;font-size:11px;color:#cfefff;letter-spacing:.6px}
+    .resvalue{font-family:Orbitron,system-ui,sans-serif;font-size:14px;color:var(--ice);letter-spacing:1px}
     .btn{
       border:1px solid #4f799f;background:#0b1b30;color:var(--ice);
       border-radius:0;padding:8px 10px;font-weight:600;cursor:pointer;
@@ -495,14 +595,13 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .btn:hover{border-color:#8de7ff;box-shadow:0 0 0 1px #95e6ff44 inset}
 
     .dock{
-      position:absolute;top:calc(var(--screen-pad) + 64px);bottom:calc(var(--screen-pad) + var(--command-h));
+      position:absolute;top:calc(var(--screen-pad) + var(--top-h) + 12px);bottom:calc(var(--screen-pad) + var(--command-h));
       width:var(--dock-w);padding:10px;border:1px solid var(--panel-edge);border-radius:0;
       background:var(--panel);backdrop-filter:blur(10px);
       box-shadow:0 14px 40px #0008;
       overflow:hidden;
       z-index:40;
     }
-    .dock.left{left:var(--screen-pad)}
     .dock.right{right:var(--screen-pad)}
     .dock h2{font-family:Orbitron,system-ui,sans-serif;font-size:13px;letter-spacing:.6px;margin-bottom:10px}
     .dock .scroll{height:100%;overflow:auto;padding-right:6px}
@@ -651,9 +750,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
     .viewport{
       position:absolute;
-      left:calc(var(--screen-pad) + var(--dock-w) + 12px);
+      left:var(--screen-pad);
       right:calc(var(--screen-pad) + var(--dock-w) + 12px);
-      top:calc(var(--screen-pad) + 64px);
+      top:calc(var(--screen-pad) + var(--top-h) + 12px);
       bottom:calc(var(--screen-pad) + var(--command-h));
       border-radius:0;border:1px solid var(--panel-edge);
       background:radial-gradient(circle at 50% 40%, #0d2a4a 0%, #061325 55%, #04070f 100%);
@@ -681,53 +780,36 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 <body>
   <div class="layout">
     <header class="topbar">
-      <div class="brand">
-        <div class="sig"></div>
-        <div>
-          <h1>CLAWDORIO</h1>
-          <div class="sub">Command Grid (local)</div>
-        </div>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px">
-        <div class="pill"><span id="connDot" class="dot"></span><span id="connText">connecting</span></div>
-        <button id="demoBtn" class="btn" type="button">demo patch</button>
+      <div class="resources" aria-label="Resources">
+        <span class="reslabel">AGENTS</span>
+        <span id="agentsCount" class="resvalue">0</span>
       </div>
     </header>
 
-    <aside class="dock left">
-      <h2>Ops</h2>
-      <div class="scroll">
-        <div class="card">
-          <div class="k">Local Engine</div>
-          <div class="v">Use the bottom palette to drag buildings into the grid.</div>
-        </div>
-        <div class="card">
-          <div class="k">Runs</div>
-          <div class="v">Coming next: OpenClaw run queue + agents.</div>
-        </div>
-      </div>
-    </aside>
-
     <main class="viewport">
       <canvas id="rtsCanvas"></canvas>
-      <div class="hint">Drag: pan | Wheel: zoom | Double-click: center | Camera persists across reloads</div>
     </main>
 
-    <aside class="dock right">
-      <h2>Intel</h2>
+    <aside class="dock right" aria-label="Questbook">
+      <h2>Questbook</h2>
       <div class="scroll">
-        <div class="card">
-          <div class="k">Selection</div>
-          <div id="selectionText" class="v">none</div>
-        </div>
-        <div class="card">
-          <div class="k">API</div>
-          <div class="v">GET <span style="font-family:Geist Mono,monospace">/health</span></div>
-          <div class="v">POST <span style="font-family:Geist Mono,monospace">/api/ui/demo</span></div>
-        </div>
-        <div class="card">
-          <div class="k">Patches</div>
-          <div id="panel.right" class="v">waiting</div>
+        <div id="questList" class="quest-list" aria-label="Quest list"></div>
+        <div class="quest-editor" aria-label="Quest editor">
+          <input id="questTitle" type="text" />
+          <textarea id="questBody" rows="6"></textarea>
+          <div class="quest-actions">
+            <select id="questKind" aria-label="Quest kind">
+              <option value="human">human</option>
+              <option value="system">system</option>
+            </select>
+            <select id="questState" aria-label="Quest state">
+              <option value="open">open</option>
+              <option value="done">done</option>
+            </select>
+            <button id="questSave" class="btn" type="button">Save</button>
+            <button id="questNew" class="btn" type="button">New</button>
+            <button id="questDelete" class="btn" type="button">Delete</button>
+          </div>
         </div>
       </div>
     </aside>
@@ -735,12 +817,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     <footer class="commandbar">
       <section class="palette-wrap">
         <div class="palette" id="palette" aria-label="Building palette"></div>
-        <div class="notice">Drag a building onto the grid. Click a placed building to open its panel.</div>
       </section>
       <section class="bottompanel" id="panel.bottom.bar" aria-label="Selection bottom panel">
-        <div class="row"><span>Camera</span><span id="camText">0,0 @ 1.00</span></div>
-        <div class="row"><span>Pointer</span><span id="ptrText">-</span></div>
-        <div class="sub" style="margin-top:10px">Select something to see its interface.</div>
       </section>
     </footer>
   </div>
@@ -749,12 +827,15 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
   (async function(){
     const $ = (id) => document.getElementById(id);
 
-    const connDot = $("connDot");
-    const connText = $("connText");
-    const selectionText = $("selectionText");
-    const camText = $("camText");
-    const ptrText = $("ptrText");
-    const demoBtn = $("demoBtn");
+    const agentsCountEl = $("agentsCount");
+    const questListEl = $("questList");
+    const questTitleEl = $("questTitle");
+    const questBodyEl = $("questBody");
+    const questKindEl = $("questKind");
+    const questStateEl = $("questState");
+    const questSaveEl = $("questSave");
+    const questNewEl = $("questNew");
+    const questDeleteEl = $("questDelete");
     const paletteEl = $("palette");
     const bottomPanel = $("panel.bottom.bar");
 
@@ -764,6 +845,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     let selected = null;
     let lastRev = 0;
     const featureDraft = new Map();
+    let quests = [];
+    let selectedQuestId = null;
+    let questDirty = false;
 
     async function loadBuildings(){
       const r = await fetch("/api/buildings", { cache: "no-store" });
@@ -786,14 +870,12 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         btn.innerHTML = `
           <span class="palette-tooltip" role="tooltip">
             <span class="tooltip-title">${esc(b.title)}</span>
-            <span class="tooltip-copy">${esc(b.copy)}</span>
           </span>
           <span class="hotkey">${esc(b.hotkey)}</span>
         `;
         btn.addEventListener("click", () => {
           draftKind = b.kind;
           selected = null;
-          selectionText.textContent = `drafting ${b.kind}`;
           updatePaletteActive();
           renderBottomPanel();
           requestDraw();
@@ -823,12 +905,119 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       return String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;" }[c]));
     }
 
+    function questById(id){
+      return quests.find((q) => String(q.id) === String(id)) || null;
+    }
+
+    function wantsBang(q){
+      if (!q) return false;
+      if (String(q.kind || "") === "human") return true;
+      if (String(q.state || "") === "done") return true;
+      return false;
+    }
+
+    function renderQuestList(){
+      if (!questListEl) return;
+      questListEl.innerHTML = "";
+      for (const q of quests){
+        const el = document.createElement("div");
+        el.className = "quest-item";
+        if (selectedQuestId && String(q.id) === String(selectedQuestId)) el.classList.add("active");
+        const bang = wantsBang(q) ? "!" : "";
+        el.innerHTML = `<div class="t">${esc(q.title || "")}</div><div class="bang">${esc(bang)}</div>`;
+        el.addEventListener("click", () => {
+          selectedQuestId = String(q.id);
+          questDirty = false;
+          syncQuestEditor();
+          renderQuestList();
+        });
+        questListEl.appendChild(el);
+      }
+      if (!quests.length){
+        const empty = document.createElement("div");
+        empty.className = "card";
+        empty.innerHTML = `<div class="k">No quests</div>`;
+        questListEl.appendChild(empty);
+      }
+    }
+
+    function syncQuestEditor(){
+      if (!questTitleEl || !questBodyEl || !questKindEl || !questStateEl) return;
+      if (questDirty) return;
+      const q = selectedQuestId ? questById(selectedQuestId) : null;
+      if (!q){
+        questTitleEl.value = "";
+        questBodyEl.value = "";
+        questKindEl.value = "human";
+        questStateEl.value = "open";
+        return;
+      }
+      questTitleEl.value = String(q.title || "");
+      questBodyEl.value = String(q.body || "");
+      questKindEl.value = String(q.kind || "human");
+      questStateEl.value = String(q.state || "open");
+    }
+
+    function wireQuestEditor(){
+      const markDirty = () => { questDirty = true; };
+      if (questTitleEl) questTitleEl.addEventListener("input", markDirty);
+      if (questBodyEl) questBodyEl.addEventListener("input", markDirty);
+      if (questKindEl) questKindEl.addEventListener("change", markDirty);
+      if (questStateEl) questStateEl.addEventListener("change", markDirty);
+
+      if (questNewEl) questNewEl.addEventListener("click", () => {
+        selectedQuestId = null;
+        questDirty = false;
+        syncQuestEditor();
+        renderQuestList();
+      });
+
+      if (questSaveEl) questSaveEl.addEventListener("click", async () => {
+        if (!questTitleEl || !questBodyEl || !questKindEl || !questStateEl) return;
+        const title = questTitleEl.value.trim();
+        if (!title) return;
+        const body = questBodyEl.value || "";
+        const kind = questKindEl.value || "human";
+        const st = questStateEl.value || "open";
+        const payload = { id: selectedQuestId, title, kind, state: st, body };
+        try{
+          const q = await fetchJson("/api/quests", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          selectedQuestId = String(q.id);
+          questDirty = false;
+          // Force refresh ASAP.
+          const st2 = await fetchJson("/api/state");
+          quests = Array.isArray(st2.quests) ? st2.quests : [];
+          renderQuestList();
+          syncQuestEditor();
+        }catch(_e){}
+      });
+
+      if (questDeleteEl) questDeleteEl.addEventListener("click", async () => {
+        if (!selectedQuestId) return;
+        try{
+          await fetchJson(`/api/quests/${encodeURIComponent(selectedQuestId)}`, { method: "DELETE" });
+          selectedQuestId = null;
+          questDirty = false;
+          const st2 = await fetchJson("/api/state");
+          quests = Array.isArray(st2.quests) ? st2.quests : [];
+          renderQuestList();
+          syncQuestEditor();
+        }catch(_e){}
+      });
+    }
+
     async function stateLoop(){
       for(;;){
         try{
           const st = await fetchJson("/api/state");
-          connDot.classList.add("ok");
-          connText.textContent = "online";
+          if (agentsCountEl) agentsCountEl.textContent = String(st.working_agents || 0);
+          quests = Array.isArray(st.quests) ? st.quests : [];
+          renderQuestList();
+          syncQuestEditor();
           const rev = Number(st.rev || 0);
           if (rev !== lastRev){
             applyState(st);
@@ -836,31 +1025,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             requestDraw();
           }
         }catch(_e){
-          connDot.classList.remove("ok");
-          connText.textContent = "offline";
+          // keep last known state
         }
         await new Promise(res => setTimeout(res, 700));
       }
     }
-
-    demoBtn.addEventListener("click", async () => {
-      const body = { selected: selected ? selected.kind : draftKind };
-      const r = await fetch("/api/ui/demo", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const j = await r.json();
-      if (j && Array.isArray(j.patches)){
-        for (const p of j.patches){
-          const t = document.getElementById(p.target);
-          if (!t) continue;
-          if (p.swap === "Replace" || !p.swap){
-            t.innerHTML = p.html || "";
-          }
-        }
-      }
-    });
 
     // RTS-ish canvas: isometric grid, draft placement, camera persist.
     const canvas = $("rtsCanvas");
@@ -894,6 +1063,42 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       return BUILDINGS.find((b) => b.kind === kind) || null;
     }
 
+    function footprintFor(kind){
+      const spec = buildingSpec(kind);
+      return {
+        w: Number(spec && spec.w ? spec.w : 3),
+        h: Number(spec && spec.h ? spec.h : 4),
+      };
+    }
+
+    function entityCoversCell(ent, cx, cy){
+      if (!ent) return false;
+      const w = Number(ent.w || 1);
+      const h = Number(ent.h || 1);
+      return cx >= ent.x && cy >= ent.y && cx < (ent.x + w) && cy < (ent.y + h);
+    }
+
+    function hitTestCell(cx, cy){
+      // Top-most by updated order isn't available client-side; use last in array.
+      for (let i = placed.length - 1; i >= 0; i--){
+        const ent = placed[i];
+        if (entityCoversCell(ent, cx, cy)) return ent;
+      }
+      return null;
+    }
+
+    function canPlace(kind, x, y){
+      const fp = footprintFor(kind);
+      for (let dy = 0; dy < fp.h; dy++){
+        for (let dx = 0; dx < fp.w; dx++){
+          const cx = x + dx;
+          const cy = y + dy;
+          if (hitTestCell(cx, cy)) return false;
+        }
+      }
+      return true;
+    }
+
     function loadImage(src){
       if (spriteCache.has(src)) return spriteCache.get(src);
       const img = new Image();
@@ -920,13 +1125,16 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       if (!st || typeof st !== "object") return;
       lastRev = Number(st.rev || 0);
       const ents = Array.isArray(st.entities) ? st.entities : [];
-      placed = ents.map((e) => ({ id: String(e.id), kind: String(e.kind), x: Number(e.x), y: Number(e.y) }));
+      placed = ents.map((e) => ({
+        id: String(e.id),
+        kind: String(e.kind),
+        x: Number(e.x),
+        y: Number(e.y),
+        w: Number(e.w || 1),
+        h: Number(e.h || 1),
+      }));
       if (selected){
-        const nextSel = placed.find((p) => p.id === selected.id) || null;
-        selected = nextSel;
-        if (selected){
-          selectionText.textContent = `${selected.kind} @ ${selected.x},${selected.y}`;
-        }
+        selected = placed.find((p) => p.id === selected.id) || null;
       }
     }
 
@@ -937,11 +1145,28 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         body: JSON.stringify({ kind, x, y }),
       });
       placed = placed.filter((p) => !(p.x === Number(ent.x) && p.y === Number(ent.y)));
-      placed.push({ id: String(ent.id), kind: String(ent.kind), x: Number(ent.x), y: Number(ent.y) });
+      placed.push({
+        id: String(ent.id),
+        kind: String(ent.kind),
+        x: Number(ent.x),
+        y: Number(ent.y),
+        w: Number(ent.w || 1),
+        h: Number(ent.h || 1),
+      });
       selected = placed.find((p) => p.id === String(ent.id)) || null;
-      if (selected){
-        selectionText.textContent = `${selected.kind} @ ${selected.x},${selected.y}`;
-      }
+      renderBottomPanel();
+      requestDraw();
+    }
+
+    async function deleteEntityById(id){
+      await fetchJson(`/api/entities/${encodeURIComponent(String(id))}`, { method: "DELETE" });
+      const st = await fetchJson("/api/state");
+      if (agentsCountEl) agentsCountEl.textContent = String(st.working_agents || 0);
+      quests = Array.isArray(st.quests) ? st.quests : [];
+      renderQuestList();
+      syncQuestEditor();
+      applyState(st);
+      selected = null;
       renderBottomPanel();
       requestDraw();
     }
@@ -1053,25 +1278,32 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         }
       }
 
-      // Placed buildings: sprites (cached) with a subtle iso base.
+      // Placed buildings: footprint + sprite (cached).
       for (const b of placed){
         const p = worldToScreen(b.x, b.y);
         const s = grid.tile * cam.z;
         const half = s*0.5;
         const quarter = s*0.25;
 
-        // Iso base diamond.
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y - quarter);
-        ctx.lineTo(p.x + half, p.y);
-        ctx.lineTo(p.x, p.y + quarter);
-        ctx.lineTo(p.x - half, p.y);
-        ctx.closePath();
         const isSel = selected && selected.id === b.id;
-        ctx.fillStyle = isSel ? "rgba(111,248,255,0.18)" : "rgba(111,248,255,0.10)";
-        ctx.fill();
-        ctx.strokeStyle = isSel ? "rgba(111,248,255,0.90)" : "rgba(111,248,255,0.45)";
-        ctx.stroke();
+        const bw = Math.max(1, Number(b.w || 1));
+        const bh = Math.max(1, Number(b.h || 1));
+
+        for (let dy = 0; dy < bh; dy++){
+          for (let dx = 0; dx < bw; dx++){
+            const pc = worldToScreen(b.x + dx, b.y + dy);
+            ctx.beginPath();
+            ctx.moveTo(pc.x, pc.y - quarter);
+            ctx.lineTo(pc.x + half, pc.y);
+            ctx.lineTo(pc.x, pc.y + quarter);
+            ctx.lineTo(pc.x - half, pc.y);
+            ctx.closePath();
+            ctx.fillStyle = isSel ? "rgba(111,248,255,0.16)" : "rgba(111,248,255,0.08)";
+            ctx.fill();
+            ctx.strokeStyle = isSel ? "rgba(111,248,255,0.85)" : "rgba(111,248,255,0.35)";
+            ctx.stroke();
+          }
+        }
 
         const spec = buildingSpec(b.kind);
         if (spec){
@@ -1093,23 +1325,48 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
       // Hover/draft ghost.
       if (state.hover){
-        const p = worldToScreen(state.hover.x, state.hover.y);
+        const kind = state.hover.kind || draftKind;
+        const fp = footprintFor(kind);
+        const valid = !!state.hover.valid;
         const s = grid.tile * cam.z;
         const half = s*0.5;
         const quarter = s*0.25;
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y - quarter);
-        ctx.lineTo(p.x + half, p.y);
-        ctx.lineTo(p.x, p.y + quarter);
-        ctx.lineTo(p.x - half, p.y);
-        ctx.closePath();
-        ctx.fillStyle = "rgba(255,208,107,0.10)";
-        ctx.fill();
-        ctx.strokeStyle = "rgba(255,208,107,0.70)";
-        ctx.stroke();
+
+        // Footprint cells.
+        for (let dy = 0; dy < fp.h; dy++){
+          for (let dx = 0; dx < fp.w; dx++){
+            const p = worldToScreen(state.hover.x + dx, state.hover.y + dy);
+            ctx.beginPath();
+            ctx.moveTo(p.x, p.y - quarter);
+            ctx.lineTo(p.x + half, p.y);
+            ctx.lineTo(p.x, p.y + quarter);
+            ctx.lineTo(p.x - half, p.y);
+            ctx.closePath();
+            ctx.fillStyle = valid ? "rgba(255,208,107,0.07)" : "rgba(255,113,152,0.06)";
+            ctx.fill();
+            ctx.strokeStyle = valid ? "rgba(255,208,107,0.65)" : "rgba(255,113,152,0.65)";
+            ctx.stroke();
+          }
+        }
+
+        // Draft sprite (transparent).
+        const spec = buildingSpec(kind);
+        if (spec){
+          const e = loadImage(spec.sprite);
+          if (e.img && e.img.complete && e.img.naturalWidth > 0){
+            const p0 = worldToScreen(state.hover.x, state.hover.y);
+            const targetW = Math.max(90, 140 * cam.z);
+            const scale = targetW / e.img.naturalWidth;
+            const dw = e.img.naturalWidth * scale;
+            const dh = e.img.naturalHeight * scale;
+            ctx.save();
+            ctx.globalAlpha = valid ? 0.45 : 0.20;
+            ctx.drawImage(e.img, p0.x - dw/2, p0.y - dh + quarter*0.25, dw, dh);
+            ctx.restore();
+          }
+        }
       }
 
-      camText.textContent = `${cam.x.toFixed(0)},${cam.y.toFixed(0)} @ ${cam.z.toFixed(2)}`;
     }
 
     function updateHover(clientX, clientY){
@@ -1118,8 +1375,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       const sy = (clientY - r.top) * dpr;
       const { wx, wy } = screenToWorld(sx, sy);
       const { gx, gy } = snapCell(wx, wy);
-      state.hover = { x: gx, y: gy };
-      ptrText.textContent = `${gx},${gy}`;
+      const fp = footprintFor(draftKind);
+      const valid = canPlace(draftKind, gx, gy);
+      state.hover = { x: gx, y: gy, kind: draftKind, w: fp.w, h: fp.h, valid };
     }
 
     canvas.addEventListener("mousemove", (e) => {
@@ -1164,16 +1422,17 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
     canvas.addEventListener("click", (e) => {
       if (!state.hover) return;
-      const hit = placed.find((b) => b.x === state.hover.x && b.y === state.hover.y) || null;
+      const hit = hitTestCell(state.hover.x, state.hover.y);
       if (hit){
         selected = hit;
-        selectionText.textContent = `${hit.kind} @ ${hit.x},${hit.y}`;
         renderBottomPanel();
         requestDraw();
         return;
       }
       // Place a building (draft) via the API (DB is source of truth).
-      createEntity(draftKind, state.hover.x, state.hover.y).catch(() => {});
+      if (canPlace(draftKind, state.hover.x, state.hover.y)){
+        createEntity(draftKind, state.hover.x, state.hover.y).catch(() => {});
+      }
     });
 
     canvas.addEventListener("dragover", (e) => {
@@ -1188,92 +1447,141 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       if (!buildingSpec(kind)) return;
       draftKind = kind;
       updatePaletteActive();
-      const existing = placed.find((b) => b.x === state.hover.x && b.y === state.hover.y) || null;
-      if (existing) return;
+      if (!canPlace(kind, state.hover.x, state.hover.y)) return;
       createEntity(kind, state.hover.x, state.hover.y).catch(() => {});
     });
 
     window.addEventListener("resize", () => resize());
     window.addEventListener("beforeunload", () => { try{ localStorage.setItem(CAMERA_KEY, JSON.stringify(cam)); }catch(_e){} });
 
+    function isTypingTarget(el){
+      if (!el) return false;
+      const tag = String(el.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (isTypingTarget(e.target)) return;
+      const key = String(e.key || "");
+      const up = key.length === 1 ? key.toUpperCase() : key;
+
+      if (up === "Escape"){
+        selected = null;
+        renderBottomPanel();
+        requestDraw();
+        return;
+      }
+      if (up === "Delete"){
+        if (selected && selected.id){
+          deleteEntityById(selected.id).catch(() => {});
+        }
+        return;
+      }
+
+      // Building hotkeys.
+      const b = BUILDINGS.find((x) => String(x.hotkey || "").toUpperCase() === up) || null;
+      if (!b) return;
+      draftKind = b.kind;
+      updatePaletteActive();
+      if (state.mouse && state.mouse.x && state.mouse.y){
+        updateHover(state.mouse.x, state.mouse.y);
+      }
+      requestDraw();
+    });
+
     function renderBottomPanel(){
       if (!bottomPanel) return;
       if (!selected){
-        bottomPanel.innerHTML = `
-          <div class="row"><span>Camera</span><span id="camText">${esc(cam.x.toFixed(0))},${esc(cam.y.toFixed(0))} @ ${esc(cam.z.toFixed(2))}</span></div>
-          <div class="row"><span>Pointer</span><span id="ptrText">${esc(ptrText.textContent || "-")}</span></div>
-          <div class="sub" style="margin-top:10px">Select something to see its interface.</div>
-        `;
+        bottomPanel.innerHTML = "";
         return;
       }
+
       const spec = buildingSpec(selected.kind);
-      if (!spec){
-        bottomPanel.innerHTML = `<h3>Selection</h3><div class="sub">Unknown: ${esc(selected.kind)}</div>`;
-        return;
-      }
-      if (selected.kind === "base"){
-        bottomPanel.innerHTML = `
-          <h3>${esc(spec.title)}</h3>
-          <div class="sub">Units assigned to this base.</div>
-          <div class="unitrow">
-            <div class="unit">
-              <div class="icon" style="background-image:url('/rts-sprites/unit-cephalon-test.webp')"></div>
-              <div><strong>Cephalon</strong><div><span>Lead agent orchestration</span></div></div>
-            </div>
-            <div class="unit">
-              <div class="icon" style="background-image:url('/rts-sprites/subunit-cephalon-test.webp')"></div>
-              <div><strong>Subunit</strong><div><span>Verifier / reviewer</span></div></div>
-            </div>
-          </div>
-        `;
-        return;
-      }
-      if (selected.kind === "feature"){
-        const key = String(selected.id || "");
-        const prev = featureDraft.get(key) || "";
-        bottomPanel.innerHTML = `
-          <h3>${esc(spec.title)}</h3>
-          <div class="sub">clawdorio feature: enter an instruction, then hit Build.</div>
-          <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
-            <textarea id="featurePrompt" rows="4" style="flex:1; width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;" placeholder="do xyz...">${esc(prev)}</textarea>
-            <button id="featureBuildBtn" class="btn" type="button" style="white-space:nowrap;">Build</button>
-          </div>
-          <div id="featureBuildResult" class="sub"></div>
-        `;
-        const ta = bottomPanel.querySelector("#featurePrompt");
-        const btn = bottomPanel.querySelector("#featureBuildBtn");
-        const out = bottomPanel.querySelector("#featureBuildResult");
-        if (ta){
-          ta.addEventListener("input", () => featureDraft.set(key, ta.value));
-        }
-        if (btn){
-          btn.addEventListener("click", async () => {
-            const prompt = ta ? ta.value : "";
-            if (!prompt.trim()){
-              if (out) out.textContent = "prompt is required";
-              return;
-            }
-            if (out) out.textContent = "building...";
-            try{
-              const res = await fetchJson("/api/feature/build", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ entity_id: key, prompt }),
-              });
-              if (out) out.textContent = `run created: ${res.run_id || "(unknown)"}`;
-            }catch(e){
-              if (out) out.textContent = String(e && e.message ? e.message : e);
-            }
-          });
-        }
-        return;
-      }
+      const title = spec ? spec.title : selected.kind;
+
       bottomPanel.innerHTML = `
-        <h3>${esc(spec.title)}</h3>
-        <div class="sub">${esc(spec.copy)}</div>
-        <div class="row"><span>Kind</span><span>${esc(selected.kind)}</span></div>
-        <div class="row"><span>Pos</span><span>${esc(selected.x)},${esc(selected.y)}</span></div>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px;">
+          <h3>${esc(title)}</h3>
+          <button id="entityDeleteBtn" class="btn" type="button">Delete</button>
+        </div>
+        <div class="row"><span>ID</span><span>${esc(selected.id || "")}</span></div>
+        <div class="row"><span>POS</span><span>${esc(selected.x)},${esc(selected.y)}</span></div>
+        <div class="row"><span>SIZE</span><span>${esc(selected.w || 1)}x${esc(selected.h || 1)}</span></div>
+        <div id="entityPanelBody" style="margin-top:10px;"></div>
       `;
+
+      const delBtn = bottomPanel.querySelector("#entityDeleteBtn");
+      if (delBtn){
+        delBtn.addEventListener("click", () => {
+          if (selected && selected.id) deleteEntityById(selected.id).catch(() => {});
+        });
+      }
+
+      const body = bottomPanel.querySelector("#entityPanelBody");
+      if (!body) return;
+
+      if (selected.kind !== "feature"){
+        body.innerHTML = "";
+        return;
+      }
+
+      const key = String(selected.id || "");
+      const prev = featureDraft.get(key) || "";
+      body.innerHTML = `
+        <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
+          <textarea id="featurePrompt" rows="4" style="flex:1; width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">${esc(prev)}</textarea>
+          <button id="featureBuildBtn" class="btn" type="button" style="white-space:nowrap;">Build</button>
+        </div>
+        <div id="featureBuildResult" class="sub"></div>
+        <div id="featureRuns" style="margin-top:10px;"></div>
+      `;
+
+      const ta = bottomPanel.querySelector("#featurePrompt");
+      const btn = bottomPanel.querySelector("#featureBuildBtn");
+      const out = bottomPanel.querySelector("#featureBuildResult");
+      const runsEl = bottomPanel.querySelector("#featureRuns");
+
+      async function refreshRuns(){
+        if (!runsEl) return;
+        try{
+          const runs = await fetchJson(`/api/runs?entity_id=${encodeURIComponent(key)}`);
+          if (!Array.isArray(runs) || !runs.length){
+            runsEl.innerHTML = "";
+            return;
+          }
+          runsEl.innerHTML = runs.map((r) => (
+            `<div class="chip">${esc(r.status)} ${esc(r.id)} ${esc(r.task)}</div>`
+          )).join("");
+        }catch(_e){
+          runsEl.innerHTML = "";
+        }
+      }
+
+      refreshRuns();
+
+      if (ta){
+        ta.addEventListener("input", () => featureDraft.set(key, ta.value));
+      }
+      if (btn){
+        btn.addEventListener("click", async () => {
+          const prompt = ta ? ta.value : "";
+          if (!prompt.trim()) return;
+          if (out) out.textContent = "building";
+          try{
+            const res = await fetchJson("/api/feature/build", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ entity_id: key, prompt }),
+            });
+            if (out) out.textContent = String(res.run_id || "");
+            refreshRuns();
+          }catch(_e){
+            if (out) out.textContent = "";
+          }
+        });
+      }
     }
 
     try{
@@ -1286,6 +1594,10 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       }
       // Initial DB-backed world state.
       const st = await fetchJson("/api/state");
+      if (agentsCountEl) agentsCountEl.textContent = String(st.working_agents || 0);
+      quests = Array.isArray(st.quests) ? st.quests : [];
+      renderQuestList();
+      syncQuestEditor();
       applyState(st);
     }catch(_e){
       // stay usable offline (palette might be empty)
@@ -1294,6 +1606,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     resize();
     renderBottomPanel();
     requestDraw();
+    wireQuestEditor();
     stateLoop();
   })();
   </script>
