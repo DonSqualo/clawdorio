@@ -1,7 +1,14 @@
-use axum::{response::Html, routing::get, routing::post, Json, Router};
+use axum::{
+    middleware,
+    response::{Html, IntoResponse},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use clawdorio_engine::Engine;
 use clawdorio_protocol::{targets, Patch, Swap, UiUpdate};
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +25,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/ui/demo", post(ui_demo))
         .with_state(Arc::new(state))
+        // Local security: allow only loopback + Tailscale by default.
+        .layer(middleware::from_fn(ip_allowlist))
         // This service is expected to be local-only and may control a local agent swarm.
         // Never use `Access-Control-Allow-Origin: *` here; it makes it easier for a random
         // website in your browser to probe/exfiltrate local state.
@@ -90,10 +99,41 @@ pub async fn serve_listener(
     };
     let app = build_router(state);
     let addr = listener.local_addr()?;
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(addr)
+}
+
+async fn ip_allowlist(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let ip = peer.ip();
+    if is_allowed_peer_ip(ip) {
+        return next.run(req).await;
+    }
+    (axum::http::StatusCode::FORBIDDEN, "forbidden").into_response()
+}
+
+fn is_allowed_peer_ip(ip: IpAddr) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+
+    // Tailscale CGNAT range (100.64.0.0/10).
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // 100.64.0.0 - 100.127.255.255
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        IpAddr::V6(_v6) => false,
+    }
 }
 
 fn local_only_cors() -> CorsLayer {
