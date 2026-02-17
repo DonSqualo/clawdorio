@@ -631,7 +631,7 @@ CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
     // Only touch rows that still look like defaults.
     conn.execute_batch(
         r#"
-UPDATE entities SET w=4, h=4 WHERE kind='base' AND w=1 AND h=1;
+UPDATE entities SET w=9, h=9 WHERE kind='base' AND w=1 AND h=1;
 UPDATE entities SET w=3, h=4 WHERE kind IN ('feature','research','warehouse','university','library','power') AND w=1 AND h=1;
 "#,
     )?;

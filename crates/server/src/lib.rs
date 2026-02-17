@@ -734,8 +734,8 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Main command hub. Place first to anchor routing and runtime links.".to_string(),
             preview: "/rts-sprites/thumb-base.webp".to_string(),
             sprite: "/rts-sprites/base_sprite-20260212a.webp".to_string(),
-            w: 4,
-            h: 4,
+            w: 9,
+            h: 9,
         },
         BuildingSpec {
             kind: "feature".to_string(),
@@ -1309,20 +1309,21 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .palette{
       display:flex;
       gap:10px;
-      overflow:auto;
+      overflow:hidden;
       padding:2px;
       border-radius:0;
       border:1px solid #4f799f55;
       background:#061325aa;
       height:100%;
       align-items:stretch;
+      flex-wrap:wrap;
     }
     .palette-card{
       width:220px;
       height:100%;
       flex:0 0 auto;
       border-radius:0;
-      border:1px solid #4f799f55;
+      border:0;
       background:
         radial-gradient(circle at 18% 22%, rgba(255,255,255,0.08) 0%, transparent 56%),
         var(--palette-bg, linear-gradient(160deg,#0d3155 0%, #0a233d 100%));
@@ -1485,13 +1486,13 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	      <section class="bottompanel" id="panel.bottom.bar" aria-label="Selection bottom panel">
 	      </section>
 	    </footer>
-	    <div id="baseCreateModal" style="display:none; position:absolute; left:var(--screen-pad); right:var(--screen-pad); bottom:calc(var(--screen-pad) + var(--command-h) + 12px); z-index:80; border:1px solid var(--panel-edge); background:#081427f0; padding:12px; box-shadow:0 18px 48px #000b;">
+	    <div id="baseCreateModal" style="display:none; position:absolute; left:var(--screen-pad); right:var(--screen-pad); bottom:calc(var(--screen-pad) + var(--command-h) + 12px); z-index:80; border:0; background:#081427f0; padding:12px; box-shadow:0 18px 48px #000b;">
 	      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
 	        <div style="font-family:Orbitron,system-ui,sans-serif; font-size:12px; letter-spacing:.6px;">Choose Repo For Base</div>
 	        <button id="baseCreateCancel" class="btn" type="button">Esc</button>
 	      </div>
 	      <div style="display:flex; gap:10px; align-items:center;">
-	        <select id="baseRepoSelect" style="flex:1; width:100%;"></select>
+	        <select id="baseRepoSelect" style="flex:1; width:100%; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; appearance:none;"></select>
 	        <button id="baseCreatePlace" class="btn" type="button">Place</button>
 	      </div>
 	    </div>
@@ -1850,9 +1851,19 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }
 
 	    function hitTestCell(cx, cy){
-	      // Top-most by updated order isn't available client-side; use last in array.
-	      for (let i = placed.length - 1; i >= 0; i--){
-	        const ent = placed[i];
+	      // Use the same depth ordering as draw() so hitboxes match what you see.
+	      const list = [...placed].sort((a, b) => {
+	        const aw = Math.max(1, Number(a.w || 1));
+	        const ah = Math.max(1, Number(a.h || 1));
+	        const bw = Math.max(1, Number(b.w || 1));
+	        const bh = Math.max(1, Number(b.h || 1));
+	        const ak = (Number(a.y || 0) + ah) - Number(a.x || 0);
+	        const bk = (Number(b.y || 0) + bh) - Number(b.x || 0);
+	        if (ak !== bk) return ak - bk;
+	        return Number(a.x || 0) - Number(b.x || 0);
+	      });
+	      for (let i = list.length - 1; i >= 0; i--){
+	        const ent = list[i];
 	        if (entityCoversCell(ent, cx, cy)) return ent;
 	      }
 	      return null;
@@ -1946,9 +1957,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    function canPlace(kind, x, y){
 	      const fp = footprintFor(kind);
 	      // Non-base buildings must connect to an existing base.
-	      if (kind !== "base"){
-	        if (!nearAnyBase(x, y, fp.w, fp.h, 9)) return false;
-	      }
+		      if (kind !== "base"){
+		        if (!nearAnyBase(x, y, fp.w, fp.h, 12)) return false;
+		      }
 	      for (let dy = 0; dy < fp.h; dy++){
 	        for (let dx = 0; dx < fp.w; dx++){
 	          const cx = x + dx;
@@ -1996,6 +2007,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	      g.drawImage(img, 0, 0, sw, sh);
 	      const data = g.getImageData(0, 0, sw, sh).data;
 	      let minX = sw, minY = sh, maxX = -1, maxY = -1;
+	      let sumBx = 0;
+	      let nBx = 0;
 	      for (let y = 0; y < sh; y++){
 	        for (let x = 0; x < sw; x++){
 	          const a = data[(y*sw + x) * 4 + 3];
@@ -2008,12 +2021,28 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	        }
 	      }
 	      if (maxX < 0 || maxY < 0) return null;
+	      // Estimate "feet" anchor: average x of the bottom-most opaque pixels.
+	      const by0 = Math.max(0, maxY - 1);
+	      for (let y = by0; y <= maxY; y++){
+	        for (let x = minX; x <= maxX; x++){
+	          const a = data[(y*sw + x) * 4 + 3];
+	          if (a > 16){
+	            sumBx += x;
+	            nBx += 1;
+	          }
+	        }
+	      }
+	      const anchorX = nBx ? (sumBx / nBx) : (minX + maxX) * 0.5;
+	      const anchorY = maxY;
 	      const minX0 = minX / s;
 	      const maxX0 = maxX / s;
 	      const maxY0 = maxY / s;
+	      const ax0 = anchorX / s;
+	      const ay0 = anchorY / s;
 	      const cx = (minX0 + maxX0) * 0.5;
 	      const bottomPad = Math.max(0, (h0 - 1) - maxY0);
-	      return { cx, bottomPad, w0, h0 };
+	      // ax/ay define where the sprite touches the ground in its own pixels.
+	      return { cx, bottomPad, ax: ax0, ay: ay0, w0, h0 };
 	    }
 
 	    async function fetchJson(url, opts){
@@ -2182,7 +2211,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         const s = grid.tile * cam.z;
         const half = s*0.5;
         const quarter = s*0.25;
-        const maxDist = 9;
+        const maxDist = 12;
         for (const b of baseZones){
           const bw = Math.max(1, Number(b.w || 1));
           const bh = Math.max(1, Number(b.h || 1));
@@ -2329,27 +2358,21 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	        if (spec){
 	          const e = loadImage(spec.sprite);
 	          if (e.img && e.img.complete && e.img.naturalWidth > 0){
-		            const targetW = Math.max(140, (b.kind === "base" ? 280 : 170) * cam.z);
+		            const targetW = Math.max(140, (b.kind === "base" ? 420 : 170) * cam.z);
 	            const scale = targetW / e.img.naturalWidth;
 	            const dw = e.img.naturalWidth * scale;
 	            const dh = e.img.naturalHeight * scale;
-	            // Shadow + floating sprite.
-	            const pc = worldToScreen(b.x + bw*0.5, b.y + bh);
-            ctx.save();
-            ctx.globalAlpha = 0.22;
-            ctx.fillStyle = "#000";
-            ctx.beginPath();
-            ctx.ellipse(pc.x, pc.y + quarter*0.35, dw*0.22, dh*0.06, 0, 0, Math.PI*2);
-            ctx.fill();
-            ctx.restore();
-
-	            const trim = e.trim;
-	            const shiftX = trim ? ((e.img.naturalWidth * 0.5) - Number(trim.cx || (e.img.naturalWidth*0.5))) * scale : 0;
-	            const shiftY = trim ? (Number(trim.bottomPad || 0) * scale) : 0;
-	            ctx.drawImage(e.img, pc.x - dw/2 + shiftX, pc.y - dh - 10*cam.z + shiftY, dw, dh);
-	          }else{
-	            // If sprites aren't ready yet, keep the world quiet (no placeholder text).
-	          }
+            // Sprite.
+            const pc = worldToScreen(b.x + bw*0.5, b.y + bh);
+            const trim = e.trim;
+            const ax = trim ? Number(trim.ax || (e.img.naturalWidth * 0.5)) : (e.img.naturalWidth * 0.5);
+            const ay = trim ? Number(trim.ay || (e.img.naturalHeight - 1)) : (e.img.naturalHeight - 1);
+            const shiftX = (e.img.naturalWidth * 0.5 - ax) * scale;
+            const shiftY = (e.img.naturalHeight - 1 - ay) * scale;
+            ctx.drawImage(e.img, pc.x - dw/2 + shiftX, pc.y - dh - 10*cam.z + shiftY, dw, dh);
+		          }else{
+		            // If sprites aren't ready yet, keep the world quiet (no placeholder text).
+		          }
 	        }
 	      }
 
@@ -2383,30 +2406,23 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	        if (spec){
 	          const e = loadImage(spec.sprite);
 	          if (e.img && e.img.complete && e.img.naturalWidth > 0){
-	            const targetW = Math.max(140, (kind === "base" ? 280 : 170) * cam.z);
+	            const targetW = Math.max(140, (kind === "base" ? 420 : 170) * cam.z);
 	            const scale = targetW / e.img.naturalWidth;
 	            const dw = e.img.naturalWidth * scale;
 	            const dh = e.img.naturalHeight * scale;
 	            const p0 = worldToScreen(state.hover.x + fp.w*0.5, state.hover.y + fp.h*0.5);
 
-            // Shadow.
-            ctx.save();
-            ctx.globalAlpha = valid ? 0.18 : 0.10;
-            ctx.fillStyle = "#000";
-            ctx.beginPath();
-            ctx.ellipse(p0.x, p0.y + quarter*0.35, dw*0.22, dh*0.06, 0, 0, Math.PI*2);
-            ctx.fill();
-            ctx.restore();
-
-	            const trim = e.trim;
-	            const shiftX = trim ? ((e.img.naturalWidth * 0.5) - Number(trim.cx || (e.img.naturalWidth*0.5))) * scale : 0;
-	            const shiftY = trim ? (Number(trim.bottomPad || 0) * scale) : 0;
-	            ctx.save();
-	            ctx.globalAlpha = valid ? 0.45 : 0.18;
-	            ctx.drawImage(e.img, p0.x - dw/2 + shiftX, p0.y - dh - 10*cam.z + shiftY, dw, dh);
-	            ctx.restore();
-	          }
-	        }
+            const trim = e.trim;
+            const ax = trim ? Number(trim.ax || (e.img.naturalWidth * 0.5)) : (e.img.naturalWidth * 0.5);
+            const ay = trim ? Number(trim.ay || (e.img.naturalHeight - 1)) : (e.img.naturalHeight - 1);
+            const shiftX = (e.img.naturalWidth * 0.5 - ax) * scale;
+            const shiftY = (e.img.naturalHeight - 1 - ay) * scale;
+		            ctx.save();
+		            ctx.globalAlpha = valid ? 0.45 : 0.18;
+		            ctx.drawImage(e.img, p0.x - dw/2 + shiftX, p0.y - dh - 10*cam.z + shiftY, dw, dh);
+		            ctx.restore();
+		          }
+		        }
 	      }
 
     }
