@@ -4,6 +4,12 @@ Tauri desktop shell + headless Rust engine/API (SQLite-backed).
 
 ## Headless hosting (Docker)
 
+Pull prebuilt image (GitHub Container Registry):
+
+```bash
+docker pull ghcr.io/donsqualo/clawdorio:latest
+```
+
 Build:
 
 ```bash
@@ -35,4 +41,3 @@ cargo run -p clawdorio-server -- --host 0.0.0.0 --port 39333
 npm install
 npm run tauri dev
 ```
-
