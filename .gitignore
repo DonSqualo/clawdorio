@@ -25,3 +25,7 @@ dist-ssr
 
 # Rust
 target
+
+# Visual tests
+visual-artifacts
+visual-artifacts/*

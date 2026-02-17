@@ -1,0 +1,12 @@
+[package]
+name = "clawdorio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Umbrella crate for Clawdorio (re-exports engine + protocol)."
+repository = "https://github.com/DonSqualo/clawdorio"
+readme = "README.md"
+
+[dependencies]
+clawdorio-engine = { version = "0.1.0", path = "../engine" }
+clawdorio-protocol = { version = "0.1.0", path = "../protocol" }

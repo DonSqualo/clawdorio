@@ -4,7 +4,14 @@ members = [
   "crates/protocol",
   "crates/engine",
   "crates/server",
+  "crates/clawdorio",
 ]
 
 # Keep the Tauri app (`src-tauri`) out of the default workspace build so
 # headless `cargo test` works on machines without WebKit/GTK system deps.
+
+# Local packaging/build uses workspace crates; publishing still uses the pinned
+# versions in each crate's `Cargo.toml`.
+[patch.crates-io]
+clawdorio-engine = { path = "crates/engine" }
+clawdorio-protocol = { path = "crates/protocol" }

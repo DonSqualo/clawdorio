@@ -93,15 +93,26 @@ impl Engine {
         w: i64,
         h: i64,
     ) -> anyhow::Result<Entity> {
+        self.create_entity_with_payload(kind, x, y, w, h, "{}")
+    }
+
+    pub fn create_entity_with_payload(
+        &self,
+        kind: &str,
+        x: i64,
+        y: i64,
+        w: i64,
+        h: i64,
+        payload_json: &str,
+    ) -> anyhow::Result<Entity> {
         let mut conn = self.open()?;
         let tx = conn.transaction()?;
         let id = new_id("ent");
         let ts = now_ms();
-        let payload_json = "{}".to_string();
         tx.execute(
             "INSERT INTO entities (id, kind, x, y, w, h, payload_json, created_at_ms, updated_at_ms, rev)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)",
-            (&id, kind, x, y, w, h, &payload_json, ts),
+            (&id, kind, x, y, w, h, payload_json, ts),
         )?;
         append_event_tx(
             &tx,
@@ -117,11 +128,95 @@ impl Engine {
             y,
             w,
             h,
-            payload_json,
+            payload_json: payload_json.to_string(),
             created_at_ms: ts,
             updated_at_ms: ts,
             rev: 1,
         })
+    }
+
+    pub fn update_entity_payload(
+        &self,
+        id: &str,
+        payload_json: &str,
+    ) -> anyhow::Result<Option<Entity>> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let now = now_ms();
+        let n = tx.execute(
+            "UPDATE entities SET payload_json=?2, updated_at_ms=?3, rev=rev+1 WHERE id=?1",
+            (id, payload_json, now),
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        append_event_tx(
+            &tx,
+            "entity.updated",
+            Some(id),
+            serde_json::json!({ "id": id }),
+        )?;
+        let ent = tx.query_row(
+            "SELECT id, kind, x, y, w, h, payload_json, created_at_ms, updated_at_ms, rev FROM entities WHERE id=?1",
+            [id],
+            |row| {
+                Ok(Entity {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    x: row.get(2)?,
+                    y: row.get(3)?,
+                    w: row.get(4)?,
+                    h: row.get(5)?,
+                    payload_json: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                    rev: row.get(9)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok(Some(ent))
+    }
+
+    pub fn update_entity_position(&self, id: &str, x: i64, y: i64) -> anyhow::Result<Option<Entity>> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let now = now_ms();
+        let n = tx.execute(
+            "UPDATE entities SET x=?2, y=?3, updated_at_ms=?4, rev=rev+1 WHERE id=?1",
+            (id, x, y, now),
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        append_event_tx(
+            &tx,
+            "entity.moved",
+            Some(id),
+            serde_json::json!({ "id": id, "x": x, "y": y }),
+        )?;
+        let ent = tx.query_row(
+            "SELECT id, kind, x, y, w, h, payload_json, created_at_ms, updated_at_ms, rev FROM entities WHERE id=?1",
+            [id],
+            |row| {
+                Ok(Entity {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    x: row.get(2)?,
+                    y: row.get(3)?,
+                    w: row.get(4)?,
+                    h: row.get(5)?,
+                    payload_json: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                    rev: row.get(9)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok(Some(ent))
     }
 
     pub fn delete_entity(&self, id: &str) -> anyhow::Result<bool> {
@@ -245,6 +340,71 @@ impl Engine {
         Ok(n > 0)
     }
 
+    pub fn list_belts(&self) -> anyhow::Result<Vec<Belt>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, a_id, b_id, kind, created_at_ms, updated_at_ms, rev
+             FROM belts
+             ORDER BY updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Belt {
+                id: row.get(0)?,
+                a_id: row.get(1)?,
+                b_id: row.get(2)?,
+                kind: row.get(3)?,
+                created_at_ms: row.get(4)?,
+                updated_at_ms: row.get(5)?,
+                rev: row.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn create_belt(&self, a_id: &str, b_id: &str, kind: &str) -> anyhow::Result<Belt> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let id = new_id("belt");
+        let ts = now_ms();
+        tx.execute(
+            "INSERT INTO belts (id, a_id, b_id, kind, created_at_ms, updated_at_ms, rev)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
+            (&id, a_id, b_id, kind, ts),
+        )?;
+        append_event_tx(
+            &tx,
+            "belt.created",
+            Some(&id),
+            serde_json::json!({ "id": id, "a_id": a_id, "b_id": b_id, "kind": kind }),
+        )?;
+        tx.commit()?;
+        Ok(Belt {
+            id,
+            a_id: a_id.to_string(),
+            b_id: b_id.to_string(),
+            kind: kind.to_string(),
+            created_at_ms: ts,
+            updated_at_ms: ts,
+            rev: 1,
+        })
+    }
+
+    pub fn delete_belt(&self, id: &str) -> anyhow::Result<bool> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let n = tx.execute("DELETE FROM belts WHERE id = ?1", [id])?;
+        if n > 0 {
+            append_event_tx(
+                &tx,
+                "belt.deleted",
+                Some(id),
+                serde_json::json!({ "id": id }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
     pub fn count_working_agents(&self) -> anyhow::Result<i64> {
         let conn = self.open()?;
         // Treat "pending" steps as active work. We count distinct agent_id so the number is stable.
@@ -287,6 +447,17 @@ pub struct Quest {
     pub kind: String,
     pub state: String,
     pub body: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub rev: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Belt {
+    pub id: String,
+    pub a_id: String,
+    pub b_id: String,
+    pub kind: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub rev: i64,
@@ -395,6 +566,19 @@ CREATE TABLE IF NOT EXISTS steps (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS belts (
+  id TEXT PRIMARY KEY,
+  a_id TEXT NOT NULL,
+  b_id TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'link',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_belts_updated_at ON belts(updated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_belts_a_id ON belts(a_id);
+CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
 "#,
         )?;
 
