@@ -1608,7 +1608,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	          <span class="palette-tooltip" role="tooltip">
 	            <span class="tooltip-title">${esc(b.title)}</span>
 	            <span class="tooltip-copy">${esc(b.copy || "")}</span>
-	            <span class="tooltip-copy" style="margin-top:6px;">${esc(b.w)}x${esc(b.h)} | ${esc(String(b.hotkey || \"\").toUpperCase())}</span>
+	            <span class="tooltip-copy" style="margin-top:6px;">${esc(b.w)}x${esc(b.h)} | ${esc(String(b.hotkey || "").toUpperCase())}</span>
 	          </span>
 	          <span class="hotkey">${esc(b.hotkey)}</span>
 	        `;

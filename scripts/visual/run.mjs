@@ -91,7 +91,24 @@ async function main() {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 
+  const errors = [];
+  page.on("pageerror", (e) => {
+    errors.push(`pageerror: ${String(e && e.message ? e.message : e)}`);
+  });
+  page.on("console", (msg) => {
+    if (msg.type() === "error") errors.push(`console.error: ${msg.text()}`);
+  });
+
   await page.goto(baseUrl, { waitUntil: "networkidle" });
+  // Fail fast if the dashboard can't reach its authoritative state endpoint.
+  try {
+    await page.waitForFunction(async () => {
+      const r = await fetch("/api/state", { cache: "no-store" });
+      return r.ok;
+    }, null, { timeout: 20_000 });
+  } catch {
+    errors.push("dashboard could not fetch /api/state");
+  }
   await page.waitForTimeout(500);
 
   const pngBytes = await page.screenshot({ fullPage: true });
@@ -99,6 +116,11 @@ async function main() {
 
   // Stop the server.
   server.kill("SIGINT");
+
+  if (errors.length) {
+    console.error(errors.join("\n"));
+    process.exit(1);
+  }
 
   const outPng = resolve(artifactsDir, "dashboard.png");
   writeFileSync(outPng, pngBytes);
