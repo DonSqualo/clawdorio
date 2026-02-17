@@ -1,18 +1,24 @@
+use axum::http::header;
+use axum::http::HeaderValue;
 use axum::{
     middleware,
     response::{Html, IntoResponse},
+    routing::delete,
     routing::get,
     routing::post,
     Json, Router,
 };
-use clawdorio_engine::Engine;
+use clawdorio_engine::{Engine, Entity};
 use clawdorio_protocol::{targets, Patch, Swap, UiUpdate};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,10 +26,29 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let sprites_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("rts-sprites");
+    let sprites = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ))
+        .service(ServeDir::new(sprites_dir));
+
     Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
+        .route("/api/state", get(api_state))
+        .route("/api/buildings", get(api_buildings))
+        .route(
+            "/api/entities",
+            get(api_entities_list).post(api_entities_create),
+        )
+        .route("/api/entities/{id}", delete(api_entities_delete))
+        .route("/api/feature/build", post(api_feature_build))
         .route("/api/ui/demo", post(ui_demo))
+        .nest_service("/rts-sprites", sprites)
         .with_state(Arc::new(state))
         // Local security: allow only loopback + Tailscale by default.
         .layer(middleware::from_fn(ip_allowlist))
@@ -39,6 +64,235 @@ async fn health() -> &'static str {
 
 async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ApiState {
+    rev: i64,
+    entities: Vec<Entity>,
+}
+
+async fn api_state(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<ApiState>, (axum::http::StatusCode, String)> {
+    let rev = state
+        .engine
+        .get_rev()
+        .map_err(internal_error("engine.get_rev"))?;
+    let entities = state
+        .engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    Ok(Json(ApiState { rev, entities }))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BuildingSpec {
+    kind: String,
+    title: String,
+    hotkey: String,
+    copy: String,
+    preview: String,
+    sprite: String,
+}
+
+async fn api_buildings() -> Json<Vec<BuildingSpec>> {
+    Json(building_specs())
+}
+
+async fn api_entities_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<Vec<Entity>>, (axum::http::StatusCode, String)> {
+    let entities = state
+        .engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    Ok(Json(entities))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateEntityInput {
+    kind: String,
+    x: i64,
+    y: i64,
+}
+
+async fn api_entities_create(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<CreateEntityInput>,
+) -> Result<Json<Entity>, (axum::http::StatusCode, String)> {
+    if !building_specs().iter().any(|b| b.kind == input.kind) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "unknown building kind".to_string(),
+        ));
+    }
+    let ent = state
+        .engine
+        .create_entity(&input.kind, input.x, input.y)
+        .map_err(internal_error("engine.create_entity"))?;
+    Ok(Json(ent))
+}
+
+async fn api_entities_delete(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let deleted = state
+        .engine
+        .delete_entity(&id)
+        .map_err(internal_error("engine.delete_entity"))?;
+    Ok(Json(serde_json::json!({ "ok": true, "deleted": deleted })))
+}
+
+#[derive(Debug, Deserialize)]
+struct FeatureBuildInput {
+    entity_id: String,
+    prompt: String,
+}
+
+async fn api_feature_build(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<FeatureBuildInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    if input.prompt.trim().is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "prompt is required".to_string(),
+        ));
+    }
+
+    let mut conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let tx = conn.transaction().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.transaction: {e}"),
+        )
+    })?;
+
+    let now = time::OffsetDateTime::now_utc();
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "now".to_string());
+    let run_id = format!("run-{}", now.unix_timestamp_nanos());
+    let task = input.prompt.trim().to_string();
+    let ctx = serde_json::json!({
+        "entity_id": input.entity_id,
+        "prompt": task,
+    })
+    .to_string();
+
+    tx.execute(
+        "INSERT INTO runs (id, workflow_id, task, status, context_json, created_at, updated_at)
+         VALUES (?1, 'feature', ?2, 'running', ?3, ?4, ?4)",
+        (&run_id, &task, &ctx, &ts),
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.insert_run: {e}"),
+        )
+    })?;
+
+    let step_row_id = format!("step-{}", now.unix_timestamp_nanos());
+    tx.execute(
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status, input_json, output_text, created_at, updated_at)
+         VALUES (?1, ?2, 'feature.lead', 'lead', 0, 'pending', ?3, NULL, ?4, ?4)",
+        (&step_row_id, &run_id, serde_json::json!({ "prompt": task }).to_string(), &ts),
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.insert_step: {e}"),
+        )
+    })?;
+
+    tx.commit().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.commit: {e}"),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "run_id": run_id,
+    })))
+}
+
+fn internal_error(
+    ctx: &'static str,
+) -> impl FnOnce(anyhow::Error) -> (axum::http::StatusCode, String) {
+    move |e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{ctx}: {e}"),
+        )
+    }
+}
+
+fn building_specs() -> Vec<BuildingSpec> {
+    vec![
+        BuildingSpec {
+            kind: "base".to_string(),
+            title: "Base Core".to_string(),
+            hotkey: "B".to_string(),
+            copy: "Main command hub. Place first to anchor routing and runtime links.".to_string(),
+            preview: "/rts-sprites/thumb-base.webp".to_string(),
+            sprite: "/rts-sprites/base_sprite-20260212a.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "feature".to_string(),
+            title: "Feature Forge".to_string(),
+            hotkey: "F".to_string(),
+            copy: "Creates feature runs. Link a base repo, draft stories, and launch agents."
+                .to_string(),
+            preview: "/rts-sprites/thumb-feature.webp".to_string(),
+            sprite: "/rts-sprites/feature_factory_sprite.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "research".to_string(),
+            title: "Research Lab".to_string(),
+            hotkey: "L".to_string(),
+            copy: "Scans repos and generates plan cards. Drag plans to seed feature drafts."
+                .to_string(),
+            preview: "/rts-sprites/thumb-research.webp".to_string(),
+            sprite: "/rts-sprites/research_lab_sprite.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "warehouse".to_string(),
+            title: "Warehouse".to_string(),
+            hotkey: "W".to_string(),
+            copy: "Stores completed artifacts and links them back to base logistics.".to_string(),
+            preview: "/rts-sprites/thumb-warehouse.webp".to_string(),
+            sprite: "/rts-sprites/warehouse_sprite.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "university".to_string(),
+            title: "University".to_string(),
+            hotkey: "U".to_string(),
+            copy: "Advanced planning campus. Uses Research Lab mechanics with a distinct skin."
+                .to_string(),
+            preview: "/rts-sprites/thumb-university.webp".to_string(),
+            sprite: "/rts-sprites/university_sprite-20260212a.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "library".to_string(),
+            title: "Library".to_string(),
+            hotkey: "Y".to_string(),
+            copy: "Knowledge vault. Uses Warehouse mechanics with a distinct skin.".to_string(),
+            preview: "/rts-sprites/thumb-library.webp".to_string(),
+            sprite: "/rts-sprites/library_sprite-20260212a.webp".to_string(),
+        },
+        BuildingSpec {
+            kind: "power".to_string(),
+            title: "Power Plant".to_string(),
+            hotkey: "P".to_string(),
+            copy: "Cron station. Uses Library placement and shows active jobs.".to_string(),
+            preview: "/rts-sprites/thumb-power.webp".to_string(),
+            sprite: "/rts-sprites/power_sprite-20260212a.webp".to_string(),
+        },
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,10 +455,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       --warn:#ffd06b;
       --bad:#ff7198;
       --dock-w:min(300px, 26vw);
-      --command-h:140px;
+      --command-h:200px;
       --screen-pad:12px;
     }
-    *{box-sizing:border-box;margin:0;padding:0}
+    /* No rounded corners anywhere (explicit style rule). */
+    *{box-sizing:border-box;margin:0;padding:0;border-radius:0 !important}
     html,body{width:100%;height:100%;overflow:hidden}
     body{
       font-family:Inter,system-ui,sans-serif;
@@ -218,30 +473,30 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .topbar{
       position:absolute;left:var(--screen-pad);right:var(--screen-pad);top:var(--screen-pad);
       height:54px;display:flex;gap:12px;align-items:center;justify-content:space-between;
-      padding:10px 12px;border:1px solid var(--panel-edge);border-radius:14px;
+      padding:10px 12px;border:1px solid var(--panel-edge);border-radius:0;
       background:linear-gradient(160deg,#0c223b 0%, #081427 100%);
       box-shadow:0 12px 30px #020c1888;
       z-index:50;
     }
     .brand{display:flex;align-items:center;gap:10px}
     .sig{
-      width:10px;height:10px;border-radius:3px;background:linear-gradient(160deg,var(--teal),var(--blue));
+      width:10px;height:10px;border-radius:0;background:linear-gradient(160deg,var(--teal),var(--blue));
       box-shadow:0 0 0 3px #6ff8ff22;
     }
     .brand h1{font-family:Orbitron,system-ui,sans-serif;font-size:14px;letter-spacing:.7px}
     .brand .sub{font-size:11px;color:var(--muted)}
     .pill{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-    .dot{width:8px;height:8px;border-radius:99px;background:var(--warn);box-shadow:0 0 0 3px #ffd06b22}
+    .dot{width:8px;height:8px;border-radius:0;background:var(--warn);box-shadow:0 0 0 3px #ffd06b22}
     .dot.ok{background:var(--ok);box-shadow:0 0 0 3px #4df5bf22}
     .btn{
       border:1px solid #4f799f;background:#0b1b30;color:var(--ice);
-      border-radius:10px;padding:8px 10px;font-weight:600;cursor:pointer;
+      border-radius:0;padding:8px 10px;font-weight:600;cursor:pointer;
     }
     .btn:hover{border-color:#8de7ff;box-shadow:0 0 0 1px #95e6ff44 inset}
 
     .dock{
       position:absolute;top:calc(var(--screen-pad) + 64px);bottom:calc(var(--screen-pad) + var(--command-h));
-      width:var(--dock-w);padding:10px;border:1px solid var(--panel-edge);border-radius:16px;
+      width:var(--dock-w);padding:10px;border:1px solid var(--panel-edge);border-radius:0;
       background:var(--panel);backdrop-filter:blur(10px);
       box-shadow:0 14px 40px #0008;
       overflow:hidden;
@@ -252,7 +507,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .dock h2{font-family:Orbitron,system-ui,sans-serif;font-size:13px;letter-spacing:.6px;margin-bottom:10px}
     .dock .scroll{height:100%;overflow:auto;padding-right:6px}
     .card{
-      border:1px solid #5fa5d655;border-radius:14px;
+      border:1px solid #5fa5d655;border-radius:0;
       background:linear-gradient(160deg,#0c223bdd 0%, #081427dd 100%);
       padding:10px;margin-bottom:10px;
     }
@@ -261,7 +516,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .list{display:flex;flex-direction:column;gap:8px}
     .item{
       display:flex;align-items:center;justify-content:space-between;gap:10px;
-      padding:10px;border-radius:12px;border:1px solid #4f799f55;background:#061325aa;
+      padding:10px;border-radius:0;border:1px solid #4f799f55;background:#061325aa;
       cursor:pointer;
     }
     .item:hover{border-color:#8de7ff}
@@ -271,29 +526,128 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     .commandbar{
       position:absolute;left:var(--screen-pad);right:var(--screen-pad);
       bottom:var(--screen-pad);height:var(--command-h);
-      border:1px solid var(--panel-edge);border-radius:18px;
+      border:1px solid var(--panel-edge);border-radius:0;
       background:linear-gradient(160deg,#0c223bcc 0%, #081427cc 100%);
       backdrop-filter:blur(10px);
       padding:12px;
       box-shadow:0 18px 48px #0009;
       z-index:45;
       display:grid;
-      grid-template-columns: 1fr 320px;
+      grid-template-columns: 1fr 460px;
       gap:12px;
     }
-    .cmdgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-    .cmd{
-      padding:10px;border-radius:14px;border:1px solid #4f799f55;background:#061325aa;
-      min-height:68px;
-      display:flex;flex-direction:column;justify-content:space-between;
+    .palette-wrap{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      min-width:0;
     }
-    .cmd .t{font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace;font-size:11px;color:#cfefff}
-    .cmd .d{font-size:11px;color:var(--muted)}
-    .mini{
-      border-radius:14px;border:1px solid #4f799f55;background:#061325aa;
-      padding:10px;display:flex;flex-direction:column;gap:10px;
+    .palette{
+      display:flex;
+      gap:10px;
+      overflow:auto;
+      padding:2px;
+      border-radius:0;
+      border:1px solid #4f799f55;
+      background:#061325aa;
     }
-    .mini .row{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted)}
+    .palette-card{
+      width:66px;
+      height:66px;
+      flex:0 0 auto;
+      border-radius:0;
+      border:1px solid #4f799f55;
+      background:
+        radial-gradient(circle at 18% 22%, rgba(255,255,255,0.08) 0%, transparent 56%),
+        var(--palette-bg, linear-gradient(160deg,#0d3155 0%, #0a233d 100%));
+      background-size:cover;
+      background-position:center;
+      box-shadow:0 10px 26px #02101f66;
+      position:relative;
+      cursor:grab;
+      outline:none;
+    }
+    .palette-card:hover{border-color:#8de7ff}
+    .palette-card:active{cursor:grabbing}
+    .palette-card.active{border-color:#6ff8ff; box-shadow:0 0 0 1px #6ff8ff55 inset, 0 12px 28px #02101f88;}
+    .palette-card .hotkey{
+      position:absolute;right:7px;bottom:7px;
+      font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size:11px;
+      color:#dff6ff;
+      padding:2px 6px;
+      border-radius:0;
+      border:1px solid #73c7ff55;
+      background:#081427cc;
+    }
+    .palette-card .palette-tooltip{
+      position:absolute;
+      left:0;
+      bottom:calc(100% + 10px);
+      width:260px;
+      padding:10px 10px 9px;
+      border-radius:0;
+      border:1px solid #5fa5d655;
+      background:#081427f0;
+      box-shadow:0 18px 46px #000b;
+      pointer-events:none;
+      opacity:0;
+      transform:translateY(4px);
+      transition:opacity .15s ease, transform .15s ease;
+      z-index:999;
+    }
+    .palette-card:hover .palette-tooltip,
+    .palette-card:focus-visible .palette-tooltip{
+      opacity:1;
+      transform:translateY(0);
+    }
+    .palette-tooltip .tooltip-title{
+      font-family:Orbitron,system-ui,sans-serif;
+      font-size:12px;
+      letter-spacing:.6px;
+      display:block;
+      margin-bottom:4px;
+      color:#dff6ff;
+    }
+    .palette-tooltip .tooltip-copy{
+      font-size:11px;
+      color:var(--muted);
+      display:block;
+      line-height:1.35;
+    }
+    .bottompanel{
+      border-radius:0;border:1px solid #4f799f55;background:#061325aa;
+      padding:10px;
+      overflow:auto;
+    }
+    .bottompanel .row{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted)}
+    .bottompanel h3{
+      font-family:Orbitron,system-ui,sans-serif;
+      font-size:12px;
+      letter-spacing:.6px;
+      margin-bottom:8px;
+    }
+    .bottompanel .sub{font-size:11px;color:var(--muted);margin-bottom:10px}
+    .unitrow{display:flex;gap:10px;flex-wrap:wrap}
+    .unit{
+      display:flex;align-items:center;gap:10px;
+      border:1px solid #4f799f55;
+      background:#081427cc;
+      border-radius:0;
+      padding:8px 10px;
+      min-width:210px;
+    }
+    .unit .icon{
+      width:44px;height:44px;border-radius:0;
+      border:1px solid #73c7ff55;
+      background:#0b1b30 center/contain no-repeat;
+    }
+    .unit strong{font-size:12px}
+    .unit span{font-size:11px;color:var(--muted)}
+    .kanban{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+    .col{border:1px solid #4f799f55;border-radius:0;background:#081427cc;padding:10px;min-height:110px}
+    .col h4{font-size:11px;color:#cfefff;margin-bottom:8px;font-family:Geist Mono,monospace}
+    .chip{border:1px solid #73c7ff55;border-radius:0;padding:8px 10px;background:#061325aa;color:var(--muted);font-size:11px;margin-bottom:8px}
 
     .viewport{
       position:absolute;
@@ -301,7 +655,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       right:calc(var(--screen-pad) + var(--dock-w) + 12px);
       top:calc(var(--screen-pad) + 64px);
       bottom:calc(var(--screen-pad) + var(--command-h));
-      border-radius:18px;border:1px solid var(--panel-edge);
+      border-radius:0;border:1px solid var(--panel-edge);
       background:radial-gradient(circle at 50% 40%, #0d2a4a 0%, #061325 55%, #04070f 100%);
       box-shadow: inset 0 0 0 1px #0007, 0 22px 70px #0008;
       overflow:hidden;
@@ -310,7 +664,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     #rtsCanvas{width:100%;height:100%;display:block}
     .hint{
       position:absolute;left:14px;bottom:14px;z-index:20;
-      padding:8px 10px;border-radius:12px;border:1px solid #5fa5d655;
+      padding:8px 10px;border-radius:0;border:1px solid #5fa5d655;
       background:#081427bb;color:var(--muted);font-size:11px;
       pointer-events:none;
     }
@@ -341,13 +695,16 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     </header>
 
     <aside class="dock left">
-      <h2>Build Queue</h2>
+      <h2>Ops</h2>
       <div class="scroll">
         <div class="card">
-          <div class="k">Draft</div>
-          <div class="v">Select a structure and place it in the grid.</div>
+          <div class="k">Local Engine</div>
+          <div class="v">Use the bottom palette to drag buildings into the grid.</div>
         </div>
-        <div id="buildList" class="list"></div>
+        <div class="card">
+          <div class="k">Runs</div>
+          <div class="v">Coming next: OpenClaw run queue + agents.</div>
+        </div>
       </div>
     </aside>
 
@@ -376,34 +733,20 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     </aside>
 
     <footer class="commandbar">
-      <section class="cmdgrid">
-        <div class="cmd">
-          <div class="t">RALLY</div>
-          <div class="d">Assign agents to a run.</div>
-        </div>
-        <div class="cmd">
-          <div class="t">DRAFT</div>
-          <div class="d">Place structures, plan belts.</div>
-        </div>
-        <div class="cmd">
-          <div class="t">OPS</div>
-          <div class="d">Run queue and tasks.</div>
-        </div>
-        <div class="cmd">
-          <div class="t">INTEL</div>
-          <div class="d">Inspect selected entity.</div>
-        </div>
+      <section class="palette-wrap">
+        <div class="palette" id="palette" aria-label="Building palette"></div>
+        <div class="notice">Drag a building onto the grid. Click a placed building to open its panel.</div>
       </section>
-      <section class="mini">
+      <section class="bottompanel" id="panel.bottom.bar" aria-label="Selection bottom panel">
         <div class="row"><span>Camera</span><span id="camText">0,0 @ 1.00</span></div>
         <div class="row"><span>Pointer</span><span id="ptrText">-</span></div>
-        <div class="row"><span>Bottom</span><span id="panel.bottom.bar">idle</span></div>
+        <div class="sub" style="margin-top:10px">Select something to see its interface.</div>
       </section>
     </footer>
   </div>
 
   <script>
-  (function(){
+  (async function(){
     const $ = (id) => document.getElementById(id);
 
     const connDot = $("connDot");
@@ -411,50 +754,92 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     const selectionText = $("selectionText");
     const camText = $("camText");
     const ptrText = $("ptrText");
-    const buildList = $("buildList");
     const demoBtn = $("demoBtn");
+    const paletteEl = $("palette");
+    const bottomPanel = $("panel.bottom.bar");
 
-    const buildItems = [
-      { id: "base.core", name: "Core", desc: "Command node" },
-      { id: "feature.research", name: "Research", desc: "Unlock tech" },
-      { id: "feature.warehouse", name: "Warehouse", desc: "Storage" },
-      { id: "feature.factory", name: "Factory", desc: "Production" },
-      { id: "feature.power", name: "Power", desc: "Energy supply" },
-    ];
-    let draftKind = buildItems[0].id;
+    // Pulled from Antfarm RTS palette/specs via the Rust API, so UI never diverges.
+    let BUILDINGS = [];
+    let draftKind = "base";
     let selected = null;
+    let lastRev = 0;
+    const featureDraft = new Map();
 
-    function renderBuildList(){
-      buildList.innerHTML = "";
-      for (const it of buildItems){
-        const el = document.createElement("div");
-        el.className = "item";
-        el.innerHTML = `<div><strong>${esc(it.name)}</strong><div><span>${esc(it.desc)}</span></div></div><span>${esc(it.id)}</span>`;
-        el.addEventListener("click", () => {
-          draftKind = it.id;
-          selected = null;
-          selectionText.textContent = `drafting ${it.id}`;
-        });
-        buildList.appendChild(el);
+    async function loadBuildings(){
+      const r = await fetch("/api/buildings", { cache: "no-store" });
+      if (!r.ok) throw new Error("buildings_fetch_failed");
+      BUILDINGS = await r.json();
+      if (Array.isArray(BUILDINGS) && BUILDINGS.length){
+        draftKind = BUILDINGS[0].kind || "base";
       }
+    }
+
+    function renderPalette(){
+      paletteEl.innerHTML = "";
+      for (const b of BUILDINGS){
+        const btn = document.createElement("button");
+        btn.className = "palette-card";
+        btn.type = "button";
+        btn.draggable = true;
+        btn.title = `${b.title} (${b.hotkey})`;
+        btn.style.setProperty("--palette-bg", `url('${b.preview}')`);
+        btn.innerHTML = `
+          <span class="palette-tooltip" role="tooltip">
+            <span class="tooltip-title">${esc(b.title)}</span>
+            <span class="tooltip-copy">${esc(b.copy)}</span>
+          </span>
+          <span class="hotkey">${esc(b.hotkey)}</span>
+        `;
+        btn.addEventListener("click", () => {
+          draftKind = b.kind;
+          selected = null;
+          selectionText.textContent = `drafting ${b.kind}`;
+          updatePaletteActive();
+          renderBottomPanel();
+          requestDraw();
+        });
+        btn.addEventListener("dragstart", (e) => {
+          draftKind = b.kind;
+          updatePaletteActive();
+          if (e.dataTransfer){
+            e.dataTransfer.setData("text/plain", b.kind);
+            e.dataTransfer.effectAllowed = "copy";
+          }
+        });
+        paletteEl.appendChild(btn);
+      }
+      updatePaletteActive();
+    }
+
+    function updatePaletteActive(){
+      paletteEl.querySelectorAll(".palette-card").forEach((el, idx) => {
+        const b = BUILDINGS[idx];
+        if (!b) return;
+        el.classList.toggle("active", b.kind === draftKind);
+      });
     }
 
     function esc(s){
       return String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;" }[c]));
     }
 
-    async function healthLoop(){
+    async function stateLoop(){
       for(;;){
         try{
-          const r = await fetch("/health", { cache: "no-store" });
-          if (!r.ok) throw new Error("bad");
+          const st = await fetchJson("/api/state");
           connDot.classList.add("ok");
           connText.textContent = "online";
+          const rev = Number(st.rev || 0);
+          if (rev !== lastRev){
+            applyState(st);
+            renderBottomPanel();
+            requestDraw();
+          }
         }catch(_e){
           connDot.classList.remove("ok");
           connText.textContent = "offline";
         }
-        await new Promise(res => setTimeout(res, 1200));
+        await new Promise(res => setTimeout(res, 700));
       }
     }
 
@@ -485,7 +870,10 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     const CAMERA_KEY = "clawdorio.camera.v1";
     const cam = { x: 0, y: 0, z: 1.0 };
     const grid = { tile: 38, cols: 64, rows: 64 };
-    const placed = [];
+    let placed = [];
+    const spriteCache = new Map();
+    let bgPattern = null;
+    let raf = 0;
 
     const state = {
       isPanning: false,
@@ -493,6 +881,70 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       mouse: { x: 0, y: 0 },
       hover: null,
     };
+
+    function requestDraw(){
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        draw();
+      });
+    }
+
+    function buildingSpec(kind){
+      return BUILDINGS.find((b) => b.kind === kind) || null;
+    }
+
+    function loadImage(src){
+      if (spriteCache.has(src)) return spriteCache.get(src);
+      const img = new Image();
+      img.decoding = "async";
+      img.loading = "eager";
+      img.src = src;
+      const p = img.decode ? img.decode().catch(() => {}) : Promise.resolve();
+      const entry = { img, ready: p };
+      spriteCache.set(src, entry);
+      p.then(() => requestDraw());
+      return entry;
+    }
+
+    async function fetchJson(url, opts){
+      const r = await fetch(url, Object.assign({ cache: "no-store" }, opts || {}));
+      if (!r.ok){
+        const t = await r.text().catch(() => "");
+        throw new Error(`${url} ${r.status} ${t}`.trim());
+      }
+      return await r.json();
+    }
+
+    function applyState(st){
+      if (!st || typeof st !== "object") return;
+      lastRev = Number(st.rev || 0);
+      const ents = Array.isArray(st.entities) ? st.entities : [];
+      placed = ents.map((e) => ({ id: String(e.id), kind: String(e.kind), x: Number(e.x), y: Number(e.y) }));
+      if (selected){
+        const nextSel = placed.find((p) => p.id === selected.id) || null;
+        selected = nextSel;
+        if (selected){
+          selectionText.textContent = `${selected.kind} @ ${selected.x},${selected.y}`;
+        }
+      }
+    }
+
+    async function createEntity(kind, x, y){
+      const ent = await fetchJson("/api/entities", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind, x, y }),
+      });
+      placed = placed.filter((p) => !(p.x === Number(ent.x) && p.y === Number(ent.y)));
+      placed.push({ id: String(ent.id), kind: String(ent.kind), x: Number(ent.x), y: Number(ent.y) });
+      selected = placed.find((p) => p.id === String(ent.id)) || null;
+      if (selected){
+        selectionText.textContent = `${selected.kind} @ ${selected.x},${selected.y}`;
+      }
+      renderBottomPanel();
+      requestDraw();
+    }
 
     function resize(){
       const r = canvas.getBoundingClientRect();
@@ -555,9 +1007,24 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     function draw(){
       ctx.clearRect(0,0,w,h);
 
-      // Background haze.
-      ctx.fillStyle = "#050913";
-      ctx.fillRect(0,0,w,h);
+      // Background: star tile pattern (Antfarm RTS asset) if available.
+      if (!bgPattern){
+        const e = loadImage("/rts-sprites/bg-space-tile-20260212b.webp");
+        if (e.img && e.img.complete && e.img.naturalWidth > 0){
+          try{
+            bgPattern = ctx.createPattern(e.img, "repeat");
+          }catch(_e){}
+        }
+      }
+      if (bgPattern){
+        ctx.fillStyle = bgPattern;
+        ctx.fillRect(0,0,w,h);
+        ctx.fillStyle = "rgba(5,9,19,0.55)";
+        ctx.fillRect(0,0,w,h);
+      }else{
+        ctx.fillStyle = "#050913";
+        ctx.fillRect(0,0,w,h);
+      }
 
       // Grid.
       const maxCells = 22;
@@ -586,26 +1053,42 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         }
       }
 
-      // Placed "buildings" as filled diamonds.
+      // Placed buildings: sprites (cached) with a subtle iso base.
       for (const b of placed){
         const p = worldToScreen(b.x, b.y);
         const s = grid.tile * cam.z;
         const half = s*0.5;
         const quarter = s*0.25;
+
+        // Iso base diamond.
         ctx.beginPath();
         ctx.moveTo(p.x, p.y - quarter);
         ctx.lineTo(p.x + half, p.y);
         ctx.lineTo(p.x, p.y + quarter);
         ctx.lineTo(p.x - half, p.y);
         ctx.closePath();
-        ctx.fillStyle = "rgba(111,248,255,0.14)";
+        const isSel = selected && selected.id === b.id;
+        ctx.fillStyle = isSel ? "rgba(111,248,255,0.18)" : "rgba(111,248,255,0.10)";
         ctx.fill();
-        ctx.strokeStyle = "rgba(111,248,255,0.55)";
+        ctx.strokeStyle = isSel ? "rgba(111,248,255,0.90)" : "rgba(111,248,255,0.45)";
         ctx.stroke();
 
-        ctx.fillStyle = "rgba(230,251,255,0.85)";
-        ctx.font = `${Math.max(10, 11*cam.z)}px Inter, system-ui, sans-serif`;
-        ctx.fillText(b.kind.split(".").pop(), p.x - half + 6, p.y - quarter - 6);
+        const spec = buildingSpec(b.kind);
+        if (spec){
+          const e = loadImage(spec.sprite);
+          if (e.img && e.img.complete && e.img.naturalWidth > 0){
+            const targetW = Math.max(90, 140 * cam.z);
+            const scale = targetW / e.img.naturalWidth;
+            const dw = e.img.naturalWidth * scale;
+            const dh = e.img.naturalHeight * scale;
+            // Anchor: bottom center of sprite on tile center.
+            ctx.drawImage(e.img, p.x - dw/2, p.y - dh + quarter*0.25, dw, dh);
+          }else{
+            ctx.fillStyle = "rgba(230,251,255,0.85)";
+            ctx.font = `${Math.max(10, 11*cam.z)}px Inter, system-ui, sans-serif`;
+            ctx.fillText(spec.title, p.x - half + 6, p.y - quarter - 6);
+          }
+        }
       }
 
       // Hover/draft ghost.
@@ -627,7 +1110,6 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       }
 
       camText.textContent = `${cam.x.toFixed(0)},${cam.y.toFixed(0)} @ ${cam.z.toFixed(2)}`;
-      requestAnimationFrame(draw);
     }
 
     function updateHover(clientX, clientY){
@@ -649,9 +1131,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         cam.x = state.panStart.camx - dx;
         cam.y = state.panStart.camy - dy;
         saveCameraThrottled();
+        requestDraw();
         return;
       }
       updateHover(e.clientX, e.clientY);
+      requestDraw();
     });
 
     canvas.addEventListener("mousedown", (e) => {
@@ -667,6 +1151,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     canvas.addEventListener("dblclick", () => {
       cam.x = 0; cam.y = 0;
       saveCameraThrottled();
+      requestDraw();
     });
 
     canvas.addEventListener("wheel", (e) => {
@@ -674,24 +1159,142 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       const dz = (e.deltaY > 0) ? -0.08 : 0.08;
       cam.z = clamp(cam.z + dz, 0.5, 2.2);
       saveCameraThrottled();
+      requestDraw();
     }, { passive: false });
 
     canvas.addEventListener("click", (e) => {
       if (!state.hover) return;
-      // Place a building (draft).
-      placed.push({ x: state.hover.x, y: state.hover.y, kind: draftKind });
-      selected = { x: state.hover.x, y: state.hover.y, kind: draftKind };
-      selectionText.textContent = `${selected.kind} @ ${selected.x},${selected.y}`;
+      const hit = placed.find((b) => b.x === state.hover.x && b.y === state.hover.y) || null;
+      if (hit){
+        selected = hit;
+        selectionText.textContent = `${hit.kind} @ ${hit.x},${hit.y}`;
+        renderBottomPanel();
+        requestDraw();
+        return;
+      }
+      // Place a building (draft) via the API (DB is source of truth).
+      createEntity(draftKind, state.hover.x, state.hover.y).catch(() => {});
+    });
+
+    canvas.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      updateHover(e.clientX, e.clientY);
+      requestDraw();
+    });
+    canvas.addEventListener("drop", (e) => {
+      e.preventDefault();
+      if (!state.hover) return;
+      const kind = (e.dataTransfer && e.dataTransfer.getData("text/plain")) ? e.dataTransfer.getData("text/plain") : draftKind;
+      if (!buildingSpec(kind)) return;
+      draftKind = kind;
+      updatePaletteActive();
+      const existing = placed.find((b) => b.x === state.hover.x && b.y === state.hover.y) || null;
+      if (existing) return;
+      createEntity(kind, state.hover.x, state.hover.y).catch(() => {});
     });
 
     window.addEventListener("resize", () => resize());
     window.addEventListener("beforeunload", () => { try{ localStorage.setItem(CAMERA_KEY, JSON.stringify(cam)); }catch(_e){} });
 
-    renderBuildList();
+    function renderBottomPanel(){
+      if (!bottomPanel) return;
+      if (!selected){
+        bottomPanel.innerHTML = `
+          <div class="row"><span>Camera</span><span id="camText">${esc(cam.x.toFixed(0))},${esc(cam.y.toFixed(0))} @ ${esc(cam.z.toFixed(2))}</span></div>
+          <div class="row"><span>Pointer</span><span id="ptrText">${esc(ptrText.textContent || "-")}</span></div>
+          <div class="sub" style="margin-top:10px">Select something to see its interface.</div>
+        `;
+        return;
+      }
+      const spec = buildingSpec(selected.kind);
+      if (!spec){
+        bottomPanel.innerHTML = `<h3>Selection</h3><div class="sub">Unknown: ${esc(selected.kind)}</div>`;
+        return;
+      }
+      if (selected.kind === "base"){
+        bottomPanel.innerHTML = `
+          <h3>${esc(spec.title)}</h3>
+          <div class="sub">Units assigned to this base.</div>
+          <div class="unitrow">
+            <div class="unit">
+              <div class="icon" style="background-image:url('/rts-sprites/unit-cephalon-test.webp')"></div>
+              <div><strong>Cephalon</strong><div><span>Lead agent orchestration</span></div></div>
+            </div>
+            <div class="unit">
+              <div class="icon" style="background-image:url('/rts-sprites/subunit-cephalon-test.webp')"></div>
+              <div><strong>Subunit</strong><div><span>Verifier / reviewer</span></div></div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+      if (selected.kind === "feature"){
+        const key = String(selected.id || "");
+        const prev = featureDraft.get(key) || "";
+        bottomPanel.innerHTML = `
+          <h3>${esc(spec.title)}</h3>
+          <div class="sub">clawdorio feature: enter an instruction, then hit Build.</div>
+          <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
+            <textarea id="featurePrompt" rows="4" style="flex:1; width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;" placeholder="do xyz...">${esc(prev)}</textarea>
+            <button id="featureBuildBtn" class="btn" type="button" style="white-space:nowrap;">Build</button>
+          </div>
+          <div id="featureBuildResult" class="sub"></div>
+        `;
+        const ta = bottomPanel.querySelector("#featurePrompt");
+        const btn = bottomPanel.querySelector("#featureBuildBtn");
+        const out = bottomPanel.querySelector("#featureBuildResult");
+        if (ta){
+          ta.addEventListener("input", () => featureDraft.set(key, ta.value));
+        }
+        if (btn){
+          btn.addEventListener("click", async () => {
+            const prompt = ta ? ta.value : "";
+            if (!prompt.trim()){
+              if (out) out.textContent = "prompt is required";
+              return;
+            }
+            if (out) out.textContent = "building...";
+            try{
+              const res = await fetchJson("/api/feature/build", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ entity_id: key, prompt }),
+              });
+              if (out) out.textContent = `run created: ${res.run_id || "(unknown)"}`;
+            }catch(e){
+              if (out) out.textContent = String(e && e.message ? e.message : e);
+            }
+          });
+        }
+        return;
+      }
+      bottomPanel.innerHTML = `
+        <h3>${esc(spec.title)}</h3>
+        <div class="sub">${esc(spec.copy)}</div>
+        <div class="row"><span>Kind</span><span>${esc(selected.kind)}</span></div>
+        <div class="row"><span>Pos</span><span>${esc(selected.x)},${esc(selected.y)}</span></div>
+      `;
+    }
+
+    try{
+      await loadBuildings();
+      renderPalette();
+      // Warm caches for instant hover/placement.
+      for (const b of BUILDINGS){
+        if (b && b.preview) loadImage(b.preview);
+        if (b && b.sprite) loadImage(b.sprite);
+      }
+      // Initial DB-backed world state.
+      const st = await fetchJson("/api/state");
+      applyState(st);
+    }catch(_e){
+      // stay usable offline (palette might be empty)
+    }
     loadCamera();
     resize();
-    requestAnimationFrame(draw);
-    healthLoop();
+    renderBottomPanel();
+    requestDraw();
+    stateLoop();
   })();
   </script>
 </body>
