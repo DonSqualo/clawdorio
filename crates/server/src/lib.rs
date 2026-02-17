@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/quests", get(api_quests_list).post(api_quests_upsert))
         .route("/api/quests/{id}", delete(api_quests_delete))
         .route("/api/runs", get(api_runs_list))
+        .route("/api/runs/{id}/steps", get(api_run_steps))
         .route("/api/feature/build", post(api_feature_build))
         .nest_service("/rts-sprites", sprites)
         .with_state(Arc::new(state))
@@ -563,6 +564,56 @@ async fn api_runs_list(
     Ok(Json(rows.filter_map(Result::ok).collect()))
 }
 
+#[derive(Debug, Serialize)]
+struct StepRow {
+    id: String,
+    step_id: String,
+    agent_id: String,
+    step_index: i64,
+    status: String,
+    output_text: Option<String>,
+    updated_at: String,
+}
+
+async fn api_run_steps(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<Vec<StepRow>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, step_id, agent_id, step_index, status, output_text, updated_at
+             FROM steps
+             WHERE run_id = ?1
+             ORDER BY step_index ASC",
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.prepare_steps: {e}"),
+            )
+        })?;
+    let rows = stmt
+        .query_map([run_id], |row| {
+            Ok(StepRow {
+                id: row.get(0)?,
+                step_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                step_index: row.get(3)?,
+                status: row.get(4)?,
+                output_text: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query_steps: {e}"),
+            )
+        })?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
 #[derive(Debug, Deserialize)]
 struct FeatureBuildInput {
     entity_id: String,
@@ -719,13 +770,13 @@ async fn api_feature_build(
 
     // Seed Antfarm-like 7-agent chain (execution is driven by listeners; DB is the queue).
     let steps = [
-        ("plan", "planner"),
-        ("setup", "setup"),
-        ("implement", "developer"),
-        ("verify", "verifier"),
-        ("test", "tester"),
-        ("pr", "pr"),
-        ("review", "reviewer"),
+        ("plan", "feature-dev/planner"),
+        ("setup", "feature-dev/setup"),
+        ("implement", "feature-dev/developer"),
+        ("verify", "feature-dev/verifier"),
+        ("test", "feature-dev/tester"),
+        ("pr", "internal/pr"),
+        ("review", "feature-dev/reviewer"),
     ];
     for (idx, (step_id, agent_id)) in steps.iter().enumerate() {
         let step_row_id = format!("step-{}-{}", now.unix_timestamp_nanos(), idx);
@@ -1179,6 +1230,9 @@ pub async fn serve_listener(
     if let Err(_e) = repair_belt_paths(&state.engine) {
         // Belts are derivable; never fail startup on this.
     }
+    // Background runner: executes pending run steps by invoking OpenClaw agents + local PR tooling.
+    let eng = state.engine.clone();
+    tokio::spawn(async move { runloop(eng).await });
     let app = build_router(state);
     let addr = listener.local_addr()?;
     axum::serve(
@@ -1188,6 +1242,320 @@ pub async fn serve_listener(
     .with_graceful_shutdown(shutdown)
     .await?;
     Ok(addr)
+}
+
+async fn runloop(engine: Engine) {
+    loop {
+        // All DB + process execution work is blocking; keep it off the async runtime.
+        let eng = engine.clone();
+        let _ = tokio::task::spawn_blocking(move || run_one_step_blocking(&eng)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingStep {
+    step_row_id: String,
+    run_id: String,
+    step_id: String,
+    agent_id: String,
+    task: String,
+    context_json: String,
+}
+
+fn run_one_step_blocking(engine: &Engine) -> anyhow::Result<()> {
+    let Some(step) = claim_next_step(engine)? else {
+        return Ok(());
+    };
+    let res = execute_step_blocking(engine, &step);
+    match res {
+        Ok(out) => finalize_step_done(engine, &step, &out)?,
+        Err(e) => finalize_step_failed(engine, &step, &e.to_string())?,
+    }
+    Ok(())
+}
+
+fn claim_next_step(engine: &Engine) -> anyhow::Result<Option<PendingStep>> {
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+
+    // Claim the next runnable step (pending, no earlier steps unfinished, and no step already running for the run).
+    let step: Option<PendingStep> = {
+        let mut stmt = tx.prepare(
+            r#"
+SELECT s.id, s.run_id, s.step_id, s.agent_id, r.task, r.context_json
+FROM steps s
+JOIN runs r ON r.id = s.run_id
+WHERE s.status = 'pending'
+  AND r.status = 'running'
+  AND NOT EXISTS (
+    SELECT 1 FROM steps s2
+    WHERE s2.run_id = s.run_id
+      AND s2.step_index < s.step_index
+      AND s2.status != 'done'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM steps s3
+    WHERE s3.run_id = s.run_id
+      AND s3.status = 'running'
+  )
+ORDER BY r.created_at ASC, s.step_index ASC
+LIMIT 1
+"#,
+        )?;
+
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?;
+        match row {
+            None => None,
+            Some(row) => Some(PendingStep {
+                step_row_id: row.get(0)?,
+                run_id: row.get(1)?,
+                step_id: row.get(2)?,
+                agent_id: row.get(3)?,
+                task: row.get(4)?,
+                context_json: row.get(5)?,
+            }),
+        }
+    };
+
+    let Some(step) = step else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    let updated = tx.execute(
+        "UPDATE steps SET status='running', updated_at=?1 WHERE id=?2 AND status='pending'",
+        (&now_rfc3339(), &step.step_row_id),
+    )?;
+    if updated == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'step.running', ?2, ?3)",
+        (
+            now_ms_i64(),
+            &step.step_row_id,
+            serde_json::json!({ "run_id": step.run_id, "step_id": step.step_id }).to_string(),
+        ),
+    )?;
+    tx.commit()?;
+
+    Ok(Some(step))
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "now".to_string())
+}
+
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn finalize_step_done(engine: &Engine, step: &PendingStep, out: &str) -> anyhow::Result<()> {
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE steps SET status='done', output_text=?1, updated_at=?2 WHERE id=?3",
+        (out, now_rfc3339(), &step.step_row_id),
+    )?;
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'step.done', ?2, ?3)",
+        (
+            now_ms_i64(),
+            &step.step_row_id,
+            serde_json::json!({ "run_id": step.run_id, "step_id": step.step_id }).to_string(),
+        ),
+    )?;
+    // If all steps done, mark run done.
+    let remaining: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM steps WHERE run_id=?1 AND status != 'done'",
+        [&step.run_id],
+        |r| r.get(0),
+    )?;
+    if remaining == 0 {
+        tx.execute(
+            "UPDATE runs SET status='done', updated_at=?1 WHERE id=?2",
+            (&now_rfc3339(), &step.run_id),
+        )?;
+        tx.execute(
+            "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'run.done', ?2, ?3)",
+            (
+                now_ms_i64(),
+                &step.run_id,
+                serde_json::json!({ "run_id": step.run_id }).to_string(),
+            ),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn finalize_step_failed(engine: &Engine, step: &PendingStep, err: &str) -> anyhow::Result<()> {
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE steps SET status='failed', output_text=?1, updated_at=?2 WHERE id=?3",
+        (err, now_rfc3339(), &step.step_row_id),
+    )?;
+    tx.execute(
+        "UPDATE runs SET status='failed', updated_at=?1 WHERE id=?2",
+        (&now_rfc3339(), &step.run_id),
+    )?;
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'step.failed', ?2, ?3)",
+        (
+            now_ms_i64(),
+            &step.step_row_id,
+            serde_json::json!({ "run_id": step.run_id, "step_id": step.step_id, "error": err }).to_string(),
+        ),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn execute_step_blocking(engine: &Engine, step: &PendingStep) -> anyhow::Result<String> {
+    let ctx: serde_json::Value =
+        serde_json::from_str(&step.context_json).unwrap_or_else(|_| serde_json::json!({}));
+    let repo = ctx
+        .get("worktree_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let branch = ctx
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pr_url = ctx
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if step.agent_id == "internal/pr" {
+        let url = create_pr(&repo, &branch, &step.task)?;
+        // Persist PR URL into run context for review step.
+        let mut conn = engine.open()?;
+        let tx = conn.transaction()?;
+        let mut v: serde_json::Value =
+            serde_json::from_str(&step.context_json).unwrap_or_else(|_| serde_json::json!({}));
+        v["pr_url"] = serde_json::Value::String(url.clone());
+        tx.execute(
+            "UPDATE runs SET context_json=?1, updated_at=?2 WHERE id=?3",
+            (v.to_string(), now_rfc3339(), &step.run_id),
+        )?;
+        tx.commit()?;
+        return Ok(url);
+    }
+
+    let msg = build_step_message(step, &repo, &branch, &pr_url);
+    let out = Command::new("openclaw")
+        .arg("agent")
+        .arg("--agent")
+        .arg(&step.agent_id)
+        .arg("--message")
+        .arg(msg)
+        .arg("--json")
+        .arg("--timeout")
+        .arg("3600")
+        .output()?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "openclaw_failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn build_step_message(step: &PendingStep, repo: &str, branch: &str, pr_url: &str) -> String {
+    match step.step_id.as_str() {
+        "plan" => format!(
+            "TASK:\n{task}\n\nREPO:\n{repo}\n\nBRANCH:\n{branch}\n\nReply with:\nSTATUS: done\nSTORIES_JSON: [{{\"id\":\"s1\",\"title\":\"...\",\"acceptance\":[\"...\"],\"tests\":[\"...\"]}}]\n",
+            task = step.task,
+            repo = repo,
+            branch = branch
+        ),
+        "setup" => format!(
+            "Prepare environment.\n\nTASK:\n{task}\n\nREPO: {repo}\nBRANCH: {branch}\n\nInstructions:\n- cd into repo\n- ensure branch exists and is checked out\n- run build/test baseline\n\nReply with:\nSTATUS: done\nBUILD_CMD: <cmd>\nTEST_CMD: <cmd>\nBASELINE: <status>\n",
+            task = step.task,
+            repo = repo,
+            branch = branch
+        ),
+        "implement" => format!(
+            "Implement the task.\n\nTASK:\n{task}\n\nREPO: {repo}\nBRANCH: {branch}\n\nRequirements:\n- implement\n- add tests\n- run tests\n- commit\n\nReply with:\nSTATUS: done\nCHANGES: ...\nTESTS: ...\n",
+            task = step.task,
+            repo = repo,
+            branch = branch
+        ),
+        "verify" => format!(
+            "Verify the developer work.\n\nTASK:\n{task}\n\nREPO: {repo}\nBRANCH: {branch}\n\nReply with:\nSTATUS: done\nNOTES: ...\n",
+            task = step.task,
+            repo = repo,
+            branch = branch
+        ),
+        "test" => format!(
+            "Integration/E2E testing.\n\nTASK:\n{task}\n\nREPO: {repo}\nBRANCH: {branch}\n\nReply with:\nSTATUS: done\nTEST_RESULTS: ...\n",
+            task = step.task,
+            repo = repo,
+            branch = branch
+        ),
+        "review" => format!(
+            "Review the PR.\n\nTASK:\n{task}\n\nPR: {pr}\n\nReply with:\nSTATUS: done\nREVIEW: ...\n",
+            task = step.task,
+            pr = pr_url
+        ),
+        _ => format!("TASK:\n{}\n", step.task),
+    }
+}
+
+fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
+    if repo.trim().is_empty() {
+        anyhow::bail!("missing_repo");
+    }
+    if branch.trim().is_empty() {
+        anyhow::bail!("missing_branch");
+    }
+    // Push branch.
+    let push = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("push")
+        .arg("-u")
+        .arg("origin")
+        .arg(branch)
+        .output()?;
+    if !push.status.success() {
+        anyhow::bail!("git_push_failed: {}", String::from_utf8_lossy(&push.stderr));
+    }
+    // Create PR (requires `gh auth login` already done on the machine).
+    let title = task.lines().next().unwrap_or("Clawdorio run").trim();
+    let body = format!("Clawdorio run for:\n\n{}", task);
+    let pr = Command::new("gh")
+        .arg("pr")
+        .arg("create")
+        .arg("--repo")
+        .arg(".")
+        .arg("--head")
+        .arg(branch)
+        .arg("--title")
+        .arg(title)
+        .arg("--body")
+        .arg(body)
+        .current_dir(repo)
+        .output()?;
+    if !pr.status.success() {
+        anyhow::bail!("gh_pr_create_failed: {}", String::from_utf8_lossy(&pr.stderr));
+    }
+    Ok(String::from_utf8_lossy(&pr.stdout).trim().to_string())
 }
 
 fn repair_belt_paths(engine: &Engine) -> anyhow::Result<()> {
@@ -3116,6 +3484,66 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       const btn = bottomPanel.querySelector("#featureBuildBtn");
       const out = bottomPanel.querySelector("#featureBuildResult");
       const runsEl = bottomPanel.querySelector("#featureRuns");
+      let activeStepRowId = null;
+
+      function stepLabel(s){
+        const m = {
+          plan: "Plan",
+          setup: "Setup",
+          implement: "Dev",
+          verify: "Verify",
+          test: "Test",
+          pr: "PR",
+          review: "Review",
+        };
+        return m[String(s.step_id || "")] || String(s.step_id || "");
+      }
+
+      function renderKanban(run, steps){
+        if (!runsEl) return;
+        const cols = 7;
+        const cards = (Array.isArray(steps) ? steps : []).map((s) => {
+          const st = String(s.status || "");
+          const isRun = st === "running";
+          const isDone = st === "done";
+          const isFail = st === "failed";
+          const cls = isRun ? "chip" : (isDone ? "chip" : (isFail ? "chip" : "chip"));
+          const title = stepLabel(s);
+          const agent = String(s.agent_id || "");
+          const small = agent.includes("/") ? agent.split("/").slice(-1)[0] : agent;
+          const act = activeStepRowId && String(activeStepRowId) === String(s.id) ? " style=\"outline:1px solid #6ff8ff55;\"" : "";
+          return `<div class="col" data-step="${esc(String(s.id))}" ${act}>
+            <h4>${esc(title)}</h4>
+            <div class="${cls}" style="margin-bottom:8px;">${esc(st)}</div>
+            <div class="k" style="font-size:10px;color:var(--muted);">${esc(small)}</div>
+          </div>`;
+        }).join("");
+
+        const prStep = (Array.isArray(steps) ? steps : []).find((s) => String(s.step_id) === "pr" && String(s.status) === "done") || null;
+        const prUrl = prStep && prStep.output_text ? String(prStep.output_text).trim() : "";
+        const prLine = prUrl ? `<div class="chip" style="margin-top:10px;">PR ${esc(prUrl)}</div>` : "";
+
+        runsEl.innerHTML = `
+          <div class="row"><span>${esc(run.status || "")}</span><span>${esc(run.id || "")}</span></div>
+          <div class="kanban" style="grid-template-columns:repeat(${cols},1fr); margin-top:10px;">${cards}</div>
+          <div id="stepOut" style="margin-top:10px;"></div>
+          ${prLine}
+        `;
+
+        const outEl = runsEl.querySelector("#stepOut");
+        if (outEl){
+          const s = (Array.isArray(steps) ? steps : []).find((x) => activeStepRowId && String(x.id) === String(activeStepRowId)) || null;
+          const txt = s && s.output_text ? String(s.output_text) : "";
+          outEl.innerHTML = txt ? `<pre style="white-space:pre-wrap; word-break:break-word; border:1px solid #4f799f55; background:#040b16; padding:10px; font-size:11px; color:#cfefff; max-height:240px; overflow:auto;">${esc(txt.slice(0, 12000))}</pre>` : "";
+        }
+
+        runsEl.querySelectorAll("[data-step]").forEach((el) => {
+          el.addEventListener("click", async () => {
+            activeStepRowId = el.getAttribute("data-step");
+            renderKanban(run, steps);
+          });
+        });
+      }
 
       async function refreshRuns(){
         if (!runsEl) return;
@@ -3125,15 +3553,30 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             runsEl.innerHTML = "";
             return;
           }
-          runsEl.innerHTML = runs.map((r) => (
-            `<div class="chip">${esc(r.status)} ${esc(r.id)} ${esc(r.task)}</div>`
-          )).join("");
+          const run = runs[0];
+          const steps = await fetchJson(`/api/runs/${encodeURIComponent(String(run.id))}/steps`);
+          // Default output panel to the running step.
+          if (!activeStepRowId){
+            const running = Array.isArray(steps) ? steps.find((s) => String(s.status) === "running") : null;
+            if (running) activeStepRowId = String(running.id);
+          }
+          renderKanban(run, steps);
         }catch(_e){
           runsEl.innerHTML = "";
         }
       }
 
       refreshRuns();
+      // Keep the kanban in sync while this panel is open.
+      const poll = setInterval(() => { refreshRuns(); }, 1100);
+      // Tear down poll if the panel gets replaced.
+      const mo = new MutationObserver(() => {
+        if (!document.body.contains(runsEl)){
+          clearInterval(poll);
+          mo.disconnect();
+        }
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
 
       if (ta){
         ta.addEventListener("input", () => featureDraft.set(key, ta.value));
