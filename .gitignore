@@ -29,3 +29,8 @@ target
 # Visual tests
 visual-artifacts
 visual-artifacts/*
+
+# Local sprite-trim experiments (keep repo clean; publish only the chosen versions).
+crates/server/assets/rts-sprites/*-20260217c.webp
+crates/server/assets/rts-sprites/*-20260217d.webp
+crates/server/assets/rts-sprites/*-20260217e.webp

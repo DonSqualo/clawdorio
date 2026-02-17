@@ -792,7 +792,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "B".to_string(),
             copy: "Main command hub. Place first to anchor routing and runtime links.".to_string(),
             preview: "/rts-sprites/thumb-base.webp".to_string(),
-            sprite: "/rts-sprites/base_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/base_sprite-20260217f.webp".to_string(),
             w: 9,
             h: 9,
         },
@@ -803,7 +803,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Creates feature runs. Link a base repo, draft stories, and launch agents."
                 .to_string(),
             preview: "/rts-sprites/thumb-feature.webp".to_string(),
-            sprite: "/rts-sprites/feature_factory_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/feature_factory_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -814,7 +814,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Scans repos and generates plan cards. Drag plans to seed feature drafts."
                 .to_string(),
             preview: "/rts-sprites/thumb-research.webp".to_string(),
-            sprite: "/rts-sprites/research_lab_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/research_lab_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -824,7 +824,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "W".to_string(),
             copy: "Stores completed artifacts and links them back to base logistics.".to_string(),
             preview: "/rts-sprites/thumb-warehouse.webp".to_string(),
-            sprite: "/rts-sprites/warehouse_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/warehouse_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -835,7 +835,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             copy: "Advanced planning campus. Uses Research Lab mechanics with a distinct skin."
                 .to_string(),
             preview: "/rts-sprites/thumb-university.webp".to_string(),
-            sprite: "/rts-sprites/university_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/university_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -845,7 +845,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "Y".to_string(),
             copy: "Knowledge vault. Uses Warehouse mechanics with a distinct skin.".to_string(),
             preview: "/rts-sprites/thumb-library.webp".to_string(),
-            sprite: "/rts-sprites/library_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/library_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -855,7 +855,7 @@ fn building_specs() -> Vec<BuildingSpec> {
             hotkey: "P".to_string(),
             copy: "Cron station. Uses Library placement and shows active jobs.".to_string(),
             preview: "/rts-sprites/thumb-power.webp".to_string(),
-            sprite: "/rts-sprites/power_sprite-20260217b.webp".to_string(),
+            sprite: "/rts-sprites/power_sprite-20260217f.webp".to_string(),
             w: 3,
             h: 4,
         },
@@ -1512,12 +1512,13 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       gap:10px;
       min-width:0;
       height:100%;
+      max-width:min(860px, 100%);
+      margin:0 auto;
     }
     .palette{
       display:grid;
-      grid-auto-flow:row;
-      grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
-      grid-auto-rows:1fr;
+      grid-template-columns:repeat(4, 1fr);
+      grid-template-rows:repeat(2, 1fr);
       gap:10px;
       overflow:hidden;
       padding:6px;
@@ -2459,8 +2460,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       return { gx, gy };
     }
 
-    function draw(){
-      ctx.clearRect(0,0,w,h);
+	    function draw(){
+	      ctx.clearRect(0,0,w,h);
 
       // Background: star tile pattern (Antfarm RTS asset) if available.
       if (!bgPattern){
@@ -2652,14 +2653,59 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	        }
 	      }
 
-      // Draft overlay.
-      if (draftKind && state.hover){
-        const kind = draftKind;
-        const fp = footprintFor(kind);
-        const valid = canPlace(kind, state.hover.x, state.hover.y);
-        const s = grid.tile * cam.z;
-        const half = s*0.5;
-        const quarter = s*0.25;
+	      // Draft overlay.
+	      if (pendingBasePlacement){
+	        const kind = "base";
+	        const fp = footprintFor(kind);
+	        const valid = canPlace(kind, pendingBasePlacement.x, pendingBasePlacement.y);
+	        const s = grid.tile * cam.z;
+	        const half = s*0.5;
+	        const quarter = s*0.25;
+
+	        const pA = worldToScreen(pendingBasePlacement.x, pendingBasePlacement.y);
+	        const pB = worldToScreen(pendingBasePlacement.x + fp.w, pendingBasePlacement.y);
+	        const pC = worldToScreen(pendingBasePlacement.x + fp.w, pendingBasePlacement.y + fp.h);
+	        const pD = worldToScreen(pendingBasePlacement.x, pendingBasePlacement.y + fp.h);
+	        ctx.beginPath();
+	        ctx.moveTo(pA.x, pA.y - quarter);
+	        ctx.lineTo(pB.x + half, pB.y);
+	        ctx.lineTo(pC.x, pC.y + quarter);
+	        ctx.lineTo(pD.x - half, pD.y);
+	        ctx.closePath();
+	        ctx.fillStyle = valid ? "rgba(255,208,107,0.06)" : "rgba(255,113,152,0.05)";
+	        ctx.fill();
+	        ctx.strokeStyle = valid ? "rgba(255,208,107,0.75)" : "rgba(255,113,152,0.75)";
+	        ctx.stroke();
+
+	        const spec = buildingSpec(kind);
+	        if (spec){
+	          const e = loadImage(spec.sprite);
+	          if (e.img && e.img.complete && e.img.naturalWidth > 0){
+	            const targetW = Math.max(140, 420 * cam.z);
+	            const scale = targetW / e.img.naturalWidth;
+	            const dw = e.img.naturalWidth * scale;
+	            const dh = e.img.naturalHeight * scale;
+	            const p0 = worldToScreen(pendingBasePlacement.x + fp.w*0.5, pendingBasePlacement.y + fp.h*0.5);
+	            const trim = e.trim;
+	            const ax = trim ? Number(trim.ax || (e.img.naturalWidth * 0.5)) : (e.img.naturalWidth * 0.5);
+	            const ay = trim ? Number(trim.ay || (e.img.naturalHeight - 1)) : (e.img.naturalHeight - 1);
+	            const shiftX = (e.img.naturalWidth * 0.5 - ax) * scale;
+	            const shiftY = (e.img.naturalHeight - 1 - ay) * scale;
+	            ctx.save();
+	            ctx.globalAlpha = valid ? 0.45 : 0.18;
+	            ctx.drawImage(e.img, p0.x - dw/2 + shiftX, p0.y - dh - 10*cam.z + shiftY, dw, dh);
+	            ctx.restore();
+	          }
+	        }
+	      }
+
+	      if (draftKind && state.hover){
+	        const kind = draftKind;
+	        const fp = footprintFor(kind);
+	        const valid = canPlace(kind, state.hover.x, state.hover.y);
+	        const s = grid.tile * cam.z;
+	        const half = s*0.5;
+	        const quarter = s*0.25;
 
         // Outline only (no per-cell highlights).
         const pA = worldToScreen(state.hover.x, state.hover.y);
@@ -2848,6 +2894,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
           pendingBasePlacement = { x: state.hover.x, y: state.hover.y };
           showBaseModal(true);
           if (baseRepoSelectEl) baseRepoSelectEl.focus();
+          // Freeze the placement ghost at the clicked cell.
+          draftKind = null;
+          updatePaletteActive();
         } else {
           createEntity(draftKind, state.hover.x, state.hover.y).catch(() => {});
         }
