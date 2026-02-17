@@ -66,12 +66,23 @@ async fn ui_demo(
 }
 
 pub async fn serve(addr: SocketAddr, db_path: PathBuf) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_listener(listener, db_path, async { std::future::pending::<()>().await }).await?;
+    Ok(())
+}
+
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    db_path: PathBuf,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<SocketAddr> {
     let state = AppState {
         engine: Engine::new(db_path),
     };
     let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
-    Ok(())
+    let addr = listener.local_addr()?;
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(addr)
 }
-
