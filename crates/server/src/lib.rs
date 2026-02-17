@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,12 +17,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/ui/demo", post(ui_demo))
         .with_state(Arc::new(state))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        // This service is expected to be local-only and may control a local agent swarm.
+        // Never use `Access-Control-Allow-Origin: *` here; it makes it easier for a random
+        // website in your browser to probe/exfiltrate local state.
+        .layer(local_only_cors())
 }
 
 async fn health() -> &'static str {
@@ -85,4 +83,43 @@ pub async fn serve_listener(
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(addr)
+}
+
+fn local_only_cors() -> CorsLayer {
+    use axum::http::header;
+    use axum::http::HeaderValue;
+    use axum::http::Method;
+
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, _req| is_allowed_local_origin(origin),
+        ))
+}
+
+fn is_allowed_local_origin(origin: &axum::http::HeaderValue) -> bool {
+    let Ok(s) = origin.to_str() else {
+        return false;
+    };
+
+    // Tauri WebView origin (production).
+    if s == "tauri://localhost" {
+        return true;
+    }
+
+    // Dev server and local reverse proxies.
+    is_http_origin_for_host(s, "localhost") || is_http_origin_for_host(s, "127.0.0.1")
+}
+
+fn is_http_origin_for_host(origin: &str, host: &str) -> bool {
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = origin.strip_prefix(scheme) {
+            if let Some(after) = rest.strip_prefix(host) {
+                // Origin is just scheme://host[:port]
+                return after.is_empty() || after.starts_with(':');
+            }
+        }
+    }
+    false
 }
