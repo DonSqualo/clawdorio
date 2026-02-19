@@ -66,6 +66,11 @@ npm run tauri dev
   - Fetch latest artifact document + metadata.
 - `GET /api/library/artifacts?agent_id=<agent-id?>&base_id=<base-id?>&run_id=<run-id?>&limit=30`
   - List artifact versions.
+- `GET /api/library/memory?agent_id=<agent-id?>&base_id=<base-id?>&run_id=<run-id?>&limit=40&before_created_at_ms=<cursor-ts?>&before_id=<cursor-id?>`
+  - Memory Inspector list API (deterministic ordering: `created_at_ms DESC, id DESC`) with summary metadata (`source`, timestamp, size, hash/version, scope/tags).
+- `GET /api/library/memory/{id}`
+  - Fetch one memory record detail (`id` accepts `artifact:<artifact-id>` or raw artifact id).
+  - Response payload is capped to avoid oversized UI render hangs (document markdown truncated at 50k chars).
 
 See `crates/server/LIBRARY_ARTIFACTS.md` for hierarchy schema and skill append semantics.
 

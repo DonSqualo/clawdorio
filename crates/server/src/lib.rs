@@ -76,6 +76,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/artifacts/rebuild", post(api_library_rebuild))
         .route("/api/library/artifacts/latest", get(api_library_latest))
         .route("/api/library/artifacts", get(api_library_list))
+        .route("/api/library/memory", get(api_library_memory_list))
+        .route("/api/library/memory/{id}", get(api_library_memory_detail))
         .route("/api/feature/build", post(api_feature_build))
         .route("/api/skills/import", post(api_skills_import))
         .route("/api/skills/graphs", get(api_skills_graphs_list))
@@ -1200,6 +1202,203 @@ async fn api_library_list(
             )
         })?;
     Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibraryMemoryQuery {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    base_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    before_created_at_ms: Option<i64>,
+    #[serde(default)]
+    before_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LibraryMemoryRecordView {
+    id: String,
+    artifact_id: String,
+    agent_id: String,
+    base_id: Option<String>,
+    run_id: Option<String>,
+    source: Option<String>,
+    timestamp_ms: i64,
+    size_bytes: usize,
+    content_hash: String,
+    version: i64,
+    scope: String,
+    tags: Vec<String>,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LibraryMemoryDetailView {
+    record: LibraryMemoryRecordView,
+    hierarchy_json: String,
+    document_md: String,
+}
+
+async fn api_library_memory_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<LibraryMemoryQuery>,
+) -> Result<Json<Vec<LibraryMemoryRecordView>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let limit = q.limit.unwrap_or(40).clamp(1, 200) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, agent_id, base_id, run_id, source_event, content_hash, version, created_at_ms, hierarchy_json, document_md
+             FROM library_artifacts
+             WHERE (?1 IS NULL OR agent_id = ?1)
+               AND (?2 IS NULL OR base_id = ?2)
+               AND (?3 IS NULL OR run_id = ?3)
+               AND (?4 IS NULL OR created_at_ms < ?4 OR (created_at_ms = ?4 AND id < ?5))
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?6",
+        )
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare_library_memory_list: {e}")))?;
+
+    let rows = stmt
+        .query_map(
+            (
+                q.agent_id.as_deref(),
+                q.base_id.as_deref(),
+                q.run_id.as_deref(),
+                q.before_created_at_ms,
+                q.before_id.as_deref(),
+                limit,
+            ),
+            |r| {
+                let id: String = r.get(0)?;
+                let agent_id: String = r.get(1)?;
+                let base_id: Option<String> = r.get(2)?;
+                let run_id: Option<String> = r.get(3)?;
+                let source: Option<String> = r.get(4)?;
+                let content_hash: String = r.get(5)?;
+                let version: i64 = r.get(6)?;
+                let timestamp_ms: i64 = r.get(7)?;
+                let hierarchy_json: String = r.get(8)?;
+                let document_md: String = r.get(9)?;
+                let size_bytes = hierarchy_json.len().saturating_add(document_md.len());
+                let scope = if run_id.is_some() {
+                    "run"
+                } else if base_id.is_some() {
+                    "base"
+                } else {
+                    "agent"
+                }
+                .to_string();
+                let summary_line = document_md
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                Ok(LibraryMemoryRecordView {
+                    id: format!("artifact:{}", id),
+                    artifact_id: id,
+                    agent_id,
+                    base_id,
+                    run_id,
+                    source,
+                    timestamp_ms,
+                    size_bytes,
+                    content_hash,
+                    version,
+                    scope,
+                    tags: vec!["library_artifact".to_string()],
+                    summary: summary_line.chars().take(160).collect(),
+                })
+            },
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query_library_memory_list: {e}"),
+            )
+        })?;
+
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+async fn api_library_memory_detail(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<LibraryMemoryDetailView>, (axum::http::StatusCode, String)> {
+    let artifact_id = id.strip_prefix("artifact:").unwrap_or(&id).to_string();
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, agent_id, base_id, run_id, source_event, content_hash, version, created_at_ms, hierarchy_json, document_md
+             FROM library_artifacts
+             WHERE id = ?1",
+        )
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare_library_memory_detail: {e}")))?;
+
+    let row = stmt
+        .query_row([artifact_id.as_str()], |r| {
+            let id: String = r.get(0)?;
+            let agent_id: String = r.get(1)?;
+            let base_id: Option<String> = r.get(2)?;
+            let run_id: Option<String> = r.get(3)?;
+            let source: Option<String> = r.get(4)?;
+            let content_hash: String = r.get(5)?;
+            let version: i64 = r.get(6)?;
+            let timestamp_ms: i64 = r.get(7)?;
+            let hierarchy_json: String = r.get(8)?;
+            let mut document_md: String = r.get(9)?;
+            const MAX_DETAIL_CHARS: usize = 50_000;
+            if document_md.len() > MAX_DETAIL_CHARS {
+                document_md.truncate(MAX_DETAIL_CHARS);
+                document_md.push_str("\n\n…(truncated)");
+            }
+            let size_bytes = hierarchy_json.len().saturating_add(document_md.len());
+            let scope = if run_id.is_some() {
+                "run"
+            } else if base_id.is_some() {
+                "base"
+            } else {
+                "agent"
+            }
+            .to_string();
+            let summary_line = document_md
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|s| s.trim())
+                .unwrap_or("");
+
+            Ok(LibraryMemoryDetailView {
+                record: LibraryMemoryRecordView {
+                    id: format!("artifact:{}", id.clone()),
+                    artifact_id: id,
+                    agent_id,
+                    base_id,
+                    run_id,
+                    source,
+                    timestamp_ms,
+                    size_bytes,
+                    content_hash,
+                    version,
+                    scope,
+                    tags: vec!["library_artifact".to_string()],
+                    summary: summary_line.chars().take(160).collect(),
+                },
+                hierarchy_json,
+                document_md,
+            })
+        })
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "memory_record_not_found".to_string(),
+            )
+        })?;
+
+    Ok(Json(row))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6064,10 +6263,35 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             <button id="libraryRefreshBtn" class="btn" type="button">Rebuild</button>
           </div>
           <div id="libraryMeta" class="sub" style="margin-top:8px;"></div>
-          <pre id="libraryDoc" style="white-space:pre-wrap; word-break:break-word; border:1px solid #4f799f55; background:#040b16; padding:10px; font-size:11px; color:#cfefff; max-height:280px; overflow:auto; margin-top:8px;"></pre>
+          <pre id="libraryDoc" style="white-space:pre-wrap; word-break:break-word; border:1px solid #4f799f55; background:#040b16; padding:10px; font-size:11px; color:#cfefff; max-height:220px; overflow:auto; margin-top:8px;"></pre>
+          <div style="margin-top:10px; border-top:1px solid #4f799f55; padding-top:8px;">
+            <h3 style="margin:0 0 6px 0; font-size:12px;">Memory Inspector</h3>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:6px; margin-bottom:8px;">
+              <input id="memoryFilterBase" placeholder="base_id" value="${esc(baseId)}" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:6px; border-radius:0;" />
+              <input id="memoryFilterRun" placeholder="run_id" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:6px; border-radius:0;" />
+              <input id="memoryFilterAgent" placeholder="agent_id" value="${esc(String(selected.id||""))}" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:6px; border-radius:0;" />
+              <button id="memoryFilterApply" class="btn" type="button">Load</button>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+              <div>
+                <div id="memoryListMeta" class="sub"></div>
+                <div id="memoryList" style="max-height:180px; overflow:auto; border:1px solid #4f799f55; background:#040b16;"></div>
+              </div>
+              <div>
+                <div id="memoryDetailMeta" class="sub">Select a record</div>
+                <pre id="memoryDetail" style="white-space:pre-wrap; word-break:break-word; border:1px solid #4f799f55; background:#040b16; padding:8px; max-height:180px; overflow:auto; margin:0;"></pre>
+              </div>
+            </div>
+          </div>
         `;
         const metaEl = body.querySelector("#libraryMeta");
         const docEl = body.querySelector("#libraryDoc");
+        const memoryListEl = body.querySelector("#memoryList");
+        const memoryListMetaEl = body.querySelector("#memoryListMeta");
+        const memoryDetailEl = body.querySelector("#memoryDetail");
+        const memoryDetailMetaEl = body.querySelector("#memoryDetailMeta");
+        let selectedMemoryId = "";
+
         const loadLatest = async () => {
           try{
             const q = `/api/library/artifacts/latest?agent_id=${encodeURIComponent(String(selected.id||""))}&base_id=${encodeURIComponent(baseId)}`;
@@ -6079,6 +6303,71 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             if (docEl) docEl.textContent = "";
           }
         };
+
+        const loadMemoryDetail = async (id) => {
+          if (!id) return;
+          try{
+            const detail = await fetchJson(`/api/library/memory/${encodeURIComponent(String(id))}`);
+            if (memoryDetailMetaEl) {
+              memoryDetailMetaEl.textContent = `${String(detail.record.scope||"")} • ${String(detail.record.content_hash||"").slice(0,12)} • ${String(detail.record.source||"")}`;
+            }
+            if (memoryDetailEl) memoryDetailEl.textContent = String(detail.document_md || "");
+          }catch(_e){
+            if (memoryDetailMetaEl) memoryDetailMetaEl.textContent = "memory detail not found";
+            if (memoryDetailEl) memoryDetailEl.textContent = "";
+          }
+        };
+
+        const loadMemoryList = async () => {
+          const baseFilterEl = body.querySelector("#memoryFilterBase");
+          const runFilterEl = body.querySelector("#memoryFilterRun");
+          const agentFilterEl = body.querySelector("#memoryFilterAgent");
+          const qs = new URLSearchParams({ limit: "40" });
+          const b = String(baseFilterEl && "value" in baseFilterEl ? baseFilterEl.value : "").trim();
+          const r = String(runFilterEl && "value" in runFilterEl ? runFilterEl.value : "").trim();
+          const a = String(agentFilterEl && "value" in agentFilterEl ? agentFilterEl.value : "").trim();
+          if (b) qs.set("base_id", b);
+          if (r) qs.set("run_id", r);
+          if (a) qs.set("agent_id", a);
+          try{
+            const rows = await fetchJson(`/api/library/memory?${qs.toString()}`);
+            if (memoryListMetaEl) memoryListMetaEl.textContent = `${Array.isArray(rows) ? rows.length : 0} records`;
+            if (!memoryListEl) return;
+            memoryListEl.innerHTML = "";
+            if (!Array.isArray(rows) || rows.length === 0){
+              memoryListEl.innerHTML = `<div style="padding:8px; color:var(--muted);">No memory records</div>`;
+              if (memoryDetailMetaEl) memoryDetailMetaEl.textContent = "Select a record";
+              if (memoryDetailEl) memoryDetailEl.textContent = "";
+              return;
+            }
+            rows.forEach((row) => {
+              const btn = document.createElement("button");
+              btn.type = "button";
+              btn.className = "btn";
+              btn.style.width = "100%";
+              btn.style.textAlign = "left";
+              btn.style.border = "0";
+              btn.style.borderBottom = "1px solid #4f799f33";
+              btn.style.background = selectedMemoryId === String(row.id||"") ? "#10365a" : "transparent";
+              btn.style.padding = "6px 8px";
+              btn.textContent = `${String(row.version||"")} • ${String(row.scope||"")} • ${String(row.summary||"")}`;
+              btn.addEventListener("click", async () => {
+                selectedMemoryId = String(row.id||"");
+                await loadMemoryDetail(selectedMemoryId);
+                await loadMemoryList();
+              });
+              memoryListEl.appendChild(btn);
+            });
+            if (!selectedMemoryId && rows[0] && rows[0].id){
+              selectedMemoryId = String(rows[0].id);
+              await loadMemoryDetail(selectedMemoryId);
+            }
+          }catch(_e){
+            if (memoryListMetaEl) memoryListMetaEl.textContent = "memory list unavailable";
+            if (memoryListEl) memoryListEl.innerHTML = "";
+          }
+        };
+
         const btn2 = body.querySelector("#libraryRefreshBtn");
         if (btn2){
           btn2.addEventListener("click", async () => {
@@ -6090,11 +6379,17 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
                 body: JSON.stringify({ agent_id: String(selected.id||""), base_id: baseId || null, source_event: "ui.rebuild" }),
               });
               await loadLatest();
+              await loadMemoryList();
             }catch(_e){}
             btn2.disabled = false;
           });
         }
+
+        const applyBtn = body.querySelector("#memoryFilterApply");
+        if (applyBtn) applyBtn.addEventListener("click", () => { selectedMemoryId = ""; loadMemoryList().catch(() => {}); });
+
         loadLatest();
+        loadMemoryList();
         return;
       }
 

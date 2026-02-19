@@ -659,3 +659,80 @@ async fn library_artifact_rebuild_and_latest() {
     .unwrap();
     assert_eq!(latest.0.id, rebuilt.0.id);
 }
+
+#[tokio::test]
+async fn library_memory_list_and_detail_are_deterministic() {
+    let engine = temp_engine();
+    let conn = engine.open().unwrap();
+    conn.execute(
+        "INSERT INTO library_artifacts (id, agent_id, base_id, run_id, source_event, hierarchy_json, document_md, content_hash, version, created_at_ms, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+        (
+            "lib-b",
+            "agent-1",
+            Some("base-1"),
+            Some("run-1"),
+            Some("seed.b"),
+            "{}",
+            "# B artifact",
+            "hash-b",
+            2_i64,
+            1000_i64,
+        ),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO library_artifacts (id, agent_id, base_id, run_id, source_event, hierarchy_json, document_md, content_hash, version, created_at_ms, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+        (
+            "lib-a",
+            "agent-1",
+            Some("base-1"),
+            Some("run-1"),
+            Some("seed.a"),
+            "{}",
+            "# A artifact",
+            "hash-a",
+            1_i64,
+            1000_i64,
+        ),
+    )
+    .unwrap();
+
+    let state = axum::extract::State(Arc::new(AppState {
+        engine: engine.clone(),
+    }));
+
+    let list = api_library_memory_list(
+        state.clone(),
+        axum::extract::Query(LibraryMemoryQuery {
+            agent_id: Some("agent-1".to_string()),
+            base_id: Some("base-1".to_string()),
+            run_id: Some("run-1".to_string()),
+            limit: Some(10),
+            before_created_at_ms: None,
+            before_id: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(list.0.len(), 2);
+    assert_eq!(list.0[0].artifact_id, "lib-b");
+    assert_eq!(list.0[1].artifact_id, "lib-a");
+
+    let detail =
+        api_library_memory_detail(state, axum::extract::Path("artifact:lib-a".to_string()))
+            .await
+            .unwrap();
+    assert_eq!(detail.0.record.artifact_id, "lib-a");
+    assert!(detail.0.document_md.contains("A artifact"));
+}
+
+#[tokio::test]
+async fn library_memory_detail_missing_is_404() {
+    let engine = temp_engine();
+    let state = axum::extract::State(Arc::new(AppState { engine }));
+    let err = api_library_memory_detail(state, axum::extract::Path("artifact:nope".to_string()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+}

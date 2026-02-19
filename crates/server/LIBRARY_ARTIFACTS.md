@@ -56,6 +56,12 @@ Blocks are deterministically sorted by `(scope, source, node_ref, title, body)` 
   - body: `{ agent_id, base_id?, run_id?, source_event? }`
 - `GET /api/library/artifacts/latest?agent_id=...&base_id?&run_id?`
 - `GET /api/library/artifacts?agent_id?&base_id?&run_id?&limit?`
+- `GET /api/library/memory?agent_id?&base_id?&run_id?&limit?&before_created_at_ms?&before_id?`
+  - Memory Inspector list API. Returns deterministic, pagination-friendly records ordered by `created_at_ms DESC, id DESC`.
+  - Fields include `source`, `timestamp_ms`, `size_bytes`, `content_hash`, `version`, `scope`, `tags`, and a short `summary`.
+- `GET /api/library/memory/{id}`
+  - Memory Inspector detail API. `id` supports `artifact:<artifact_id>` and raw `artifact_id`.
+  - Detail payload caps markdown at 50k chars to protect UI rendering.
 
 ## Lifecycle linkage
 
