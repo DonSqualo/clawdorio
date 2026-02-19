@@ -2449,11 +2449,6 @@ fn now_ms_i64() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn has_gh_auth() -> bool {
-    let out = Command::new("gh").arg("auth").arg("status").output();
-    matches!(out, Ok(o) if o.status.success())
-}
-
 fn finalize_step_done(engine: &Engine, step: &PendingStep, out: &str) -> anyhow::Result<()> {
     let mut conn = engine.open()?;
     let tx = conn.transaction()?;
