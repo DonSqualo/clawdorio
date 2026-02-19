@@ -21,6 +21,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Engine,
@@ -59,6 +62,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/runs", get(api_runs_list))
         .route("/api/runs/{id}/steps", get(api_run_steps))
         .route("/api/feature/build", post(api_feature_build))
+        .route("/api/workers/reemit", post(api_workers_reemit_global))
+        .route(
+            "/api/bases/{id}/workers/reemit",
+            post(api_workers_reemit_base),
+        )
         .nest_service("/rts-sprites", sprites)
         .with_state(Arc::new(state))
         // Local security: allow only loopback + Tailscale by default.
@@ -192,22 +200,25 @@ async fn api_entities_create(
         return Err((axum::http::StatusCode::CONFLICT, "overlap".to_string()));
     }
     if overlaps_any_belt(&belts, input.x, input.y, fp.0, fp.1) {
-        return Err((
-            axum::http::StatusCode::CONFLICT,
-            "overlap_belt".to_string(),
-        ));
+        return Err((axum::http::StatusCode::CONFLICT, "overlap_belt".to_string()));
     }
 
     let mut payload = serde_json::json!({});
     if input.kind == "base" {
         let repo_path = input.repo_path.as_deref().unwrap_or("").trim();
         if repo_path.is_empty() {
-            return Err((axum::http::StatusCode::BAD_REQUEST, "repo_path_required".to_string()));
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "repo_path_required".to_string(),
+            ));
         }
         let p = std::path::Path::new(repo_path);
         let git_dir = p.join(".git");
         if !git_dir.exists() {
-            return Err((axum::http::StatusCode::BAD_REQUEST, "not_git_repo".to_string()));
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "not_git_repo".to_string(),
+            ));
         }
         payload["repo_path"] = serde_json::Value::String(repo_path.to_string());
     } else {
@@ -470,7 +481,10 @@ async fn api_belts_create(
     let a_id = input.a_id.trim();
     let b_id = input.b_id.trim();
     if a_id.is_empty() || b_id.is_empty() {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "a_id and b_id required".to_string()));
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "a_id and b_id required".to_string(),
+        ));
     }
     let kind = input.kind.as_deref().unwrap_or("link");
     // Compute a path so belts actually occupy space.
@@ -655,9 +669,14 @@ async fn api_feature_build(
             "not_a_factory".to_string(),
         ));
     }
-    let base_id = payload_base_id(factory)
-        .ok_or((axum::http::StatusCode::BAD_REQUEST, "missing_base".to_string()))?;
-    let Some(base) = entities.iter().find(|e| e.kind == "base" && e.id == base_id) else {
+    let base_id = payload_base_id(factory).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "missing_base".to_string(),
+    ))?;
+    let Some(base) = entities
+        .iter()
+        .find(|e| e.kind == "base" && e.id == base_id)
+    else {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "missing_base".to_string(),
@@ -730,7 +749,8 @@ async fn api_feature_build(
         "worktree_path": wt_dir_s.clone(),
         "branch": branch.clone(),
         "prompt": task,
-    }).to_string();
+    })
+    .to_string();
 
     let mut conn = state.engine.open().map_err(internal_error("engine.open"))?;
     let tx = conn.transaction().map_err(|e| {
@@ -742,7 +762,7 @@ async fn api_feature_build(
 
     tx.execute(
         "INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at)
-         VALUES (?1, 'feature-dev', ?2, 'running', ?3, ?4, ?5, ?5)",
+         VALUES (?1, 'feature-dev', ?2, 'queued', ?3, ?4, ?5, ?5)",
         (&run_id, &task, &input.entity_id, &ctx, &ts),
     )
     .map_err(|e| {
@@ -782,7 +802,7 @@ async fn api_feature_build(
         let step_row_id = format!("step-{}-{}", now.unix_timestamp_nanos(), idx);
         tx.execute(
             "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status, input_json, output_text, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, ?7, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, NULL, ?7, ?7)",
             (
                 &step_row_id,
                 &run_id,
@@ -822,6 +842,155 @@ async fn api_feature_build(
         "run_id": run_id,
         "worktree_path": wt_dir_s,
     })))
+}
+
+async fn api_workers_reemit_global(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let report = reemit_workers(&state.engine, None).map_err(internal_error("reemit_workers"))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "scope": "global", "report": report }),
+    ))
+}
+
+async fn api_workers_reemit_base(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(base_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let report = reemit_workers(&state.engine, Some(base_id.as_str()))
+        .map_err(internal_error("reemit_workers"))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "scope": "base", "base_id": base_id, "report": report }),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct ReemitReport {
+    scanned_runs: usize,
+    queued_steps: usize,
+    reset_running_steps: usize,
+    touched_runs: usize,
+}
+
+fn reemit_workers(engine: &Engine, base_id: Option<&str>) -> anyhow::Result<ReemitReport> {
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    let mut scanned_runs = 0usize;
+    let mut queued_steps = 0usize;
+    let mut reset_running_steps = 0usize;
+    let mut touched_runs = 0usize;
+
+    let run_rows: Vec<(String, Option<String>, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, entity_id, status FROM runs WHERE status IN ('queued','running','failed') ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    for (run_id, entity_id, run_status) in run_rows {
+        if let Some(scope_base) = base_id {
+            let Some(entity_id) = entity_id.as_deref() else {
+                continue;
+            };
+            let payload: Option<String> = tx
+                .query_row(
+                    "SELECT payload_json FROM entities WHERE id=?1",
+                    [entity_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let in_base = payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                .and_then(|v| {
+                    v.get("base_id")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                })
+                .map(|b| b == scope_base)
+                .unwrap_or(false);
+            if !in_base {
+                continue;
+            }
+        }
+
+        scanned_runs += 1;
+
+        let running_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM steps WHERE run_id=?1 AND status='running'",
+            [&run_id],
+            |r| r.get(0),
+        )?;
+
+        if running_count == 0 {
+            let c = tx.execute(
+                "UPDATE steps SET status='queued', updated_at=?1
+                 WHERE run_id=?2 AND status IN ('pending','waiting')",
+                (&now_rfc3339(), &run_id),
+            )?;
+            queued_steps += c as usize;
+        } else {
+            // stale-running fallback: allow operator to re-emit and recover crashed workers
+            let c = tx.execute(
+                "UPDATE steps SET status='queued', updated_at=?1
+                 WHERE run_id=?2 AND status='running'",
+                (&now_rfc3339(), &run_id),
+            )?;
+            if c > 0 {
+                reset_running_steps += c as usize;
+                queued_steps += c as usize;
+            }
+        }
+
+        let has_failed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM steps WHERE run_id=?1 AND status='failed'",
+            [&run_id],
+            |r| r.get(0),
+        )?;
+        if has_failed > 0 {
+            let c = tx.execute(
+                "UPDATE steps SET status='queued', output_text=NULL, updated_at=?1
+                 WHERE run_id=?2 AND step_index >= (
+                    SELECT COALESCE(MIN(step_index), 0) FROM steps WHERE run_id=?2 AND status='failed'
+                 )",
+                (&now_rfc3339(), &run_id),
+            )?;
+            queued_steps += c as usize;
+        }
+
+        if run_status != "done" {
+            let u = tx.execute(
+                "UPDATE runs SET status='queued', updated_at=?1 WHERE id=?2 AND status != 'done'",
+                (&now_rfc3339(), &run_id),
+            )?;
+            if u > 0 {
+                touched_runs += 1;
+            }
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'workers.reemit', NULL, ?2)",
+        (
+            now_ms_i64(),
+            serde_json::json!({
+                "scope": base_id.unwrap_or("global"),
+                "scanned_runs": scanned_runs,
+                "queued_steps": queued_steps,
+                "reset_running_steps": reset_running_steps,
+                "touched_runs": touched_runs,
+            })
+            .to_string(),
+        ),
+    )?;
+    tx.commit()?;
+
+    Ok(ReemitReport {
+        scanned_runs,
+        queued_steps,
+        reset_running_steps,
+        touched_runs,
+    })
 }
 
 fn internal_error(
@@ -985,7 +1154,8 @@ fn dist_1d(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
 }
 
 fn payload_base_id(ent: &Entity) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(&ent.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+    let v: serde_json::Value =
+        serde_json::from_str(&ent.payload_json).unwrap_or_else(|_| serde_json::json!({}));
     v.get("base_id")
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
@@ -1001,10 +1171,8 @@ fn entity_center(ent: &Entity) -> (f64, f64) {
 fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
     let entities = engine.list_entities()?;
     let belts = engine.list_belts().unwrap_or_default();
-    let mut seen: std::collections::HashSet<(String, String)> = belts
-        .into_iter()
-        .map(|b| (b.a_id, b.b_id))
-        .collect();
+    let mut seen: std::collections::HashSet<(String, String)> =
+        belts.into_iter().map(|b| (b.a_id, b.b_id)).collect();
 
     let add = |seen: &mut std::collections::HashSet<(String, String)>,
                engine: &Engine,
@@ -1019,8 +1187,12 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
         if seen.contains(&key) {
             return;
         }
-        let Some(ae) = entities.iter().find(|e| e.id == a) else { return; };
-        let Some(be) = entities.iter().find(|e| e.id == b) else { return; };
+        let Some(ae) = entities.iter().find(|e| e.id == a) else {
+            return;
+        };
+        let Some(be) = entities.iter().find(|e| e.id == b) else {
+            return;
+        };
         let path = belt_path_cells(entities, ae, be);
         let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string());
         if engine.create_belt(a, b, kind, &path_json).is_ok() {
@@ -1036,7 +1208,10 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
     let Some(base_id) = payload_base_id(ent) else {
         return Ok(());
     };
-    let Some(base) = entities.iter().find(|e| e.kind == "base" && e.id == base_id) else {
+    let Some(base) = entities
+        .iter()
+        .find(|e| e.kind == "base" && e.id == base_id)
+    else {
         return Ok(());
     };
 
@@ -1049,7 +1224,10 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
         // Warehouses connect to nearest lab (research/university) for the same base.
         let (ex, ey) = entity_center(ent);
         let mut best: Option<(&Entity, f64)> = None;
-        for cand in entities.iter().filter(|e| matches!(e.kind.as_str(), "research" | "university")) {
+        for cand in entities
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "research" | "university"))
+        {
             if payload_base_id(cand).as_deref() != Some(&base_id) {
                 continue;
             }
@@ -1058,13 +1236,13 @@ fn seed_belts_for_entity(engine: &Engine, ent: &Entity) -> anyhow::Result<()> {
             if best.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
                 best = Some((cand, d));
             }
-	        }
-	        if let Some((lab, _)) = best {
-	            add(&mut seen, engine, &entities, &lab.id, &ent.id, "link");
-	        } else {
-	            add(&mut seen, engine, &entities, &base.id, &ent.id, "link");
-	        }
-	    }
+        }
+        if let Some((lab, _)) = best {
+            add(&mut seen, engine, &entities, &lab.id, &ent.id, "link");
+        } else {
+            add(&mut seen, engine, &entities, &base.id, &ent.id, "link");
+        }
+    }
 
     if kind == "feature" {
         // Factories connect to base and (if present) the nearest warehouse.
@@ -1245,10 +1423,25 @@ pub async fn serve_listener(
 }
 
 async fn runloop(engine: Engine) {
+    let mut idle_loops: u32 = 0;
     loop {
         // All DB + process execution work is blocking; keep it off the async runtime.
         let eng = engine.clone();
-        let _ = tokio::task::spawn_blocking(move || run_one_step_blocking(&eng)).await;
+        let ran = tokio::task::spawn_blocking(move || run_one_step_blocking(&eng).unwrap_or(false))
+            .await
+            .unwrap_or(false);
+
+        if ran {
+            idle_loops = 0;
+        } else {
+            idle_loops = idle_loops.saturating_add(1);
+            // Safety net: periodically reemit queued/pending work if workers appear stuck.
+            if idle_loops % 30 == 0 {
+                let eng = engine.clone();
+                let _ = tokio::task::spawn_blocking(move || reemit_workers(&eng, None)).await;
+            }
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
 }
@@ -1263,16 +1456,16 @@ struct PendingStep {
     context_json: String,
 }
 
-fn run_one_step_blocking(engine: &Engine) -> anyhow::Result<()> {
+fn run_one_step_blocking(engine: &Engine) -> anyhow::Result<bool> {
     let Some(step) = claim_next_step(engine)? else {
-        return Ok(());
+        return Ok(false);
     };
     let res = execute_step_blocking(engine, &step);
     match res {
         Ok(out) => finalize_step_done(engine, &step, &out)?,
         Err(e) => finalize_step_failed(engine, &step, &e.to_string())?,
     }
-    Ok(())
+    Ok(true)
 }
 
 fn claim_next_step(engine: &Engine) -> anyhow::Result<Option<PendingStep>> {
@@ -1286,13 +1479,13 @@ fn claim_next_step(engine: &Engine) -> anyhow::Result<Option<PendingStep>> {
 SELECT s.id, s.run_id, s.step_id, s.agent_id, r.task, r.context_json
 FROM steps s
 JOIN runs r ON r.id = s.run_id
-WHERE s.status = 'pending'
-  AND r.status = 'running'
+WHERE s.status IN ('queued','pending')
+  AND r.status IN ('queued','running')
   AND NOT EXISTS (
     SELECT 1 FROM steps s2
     WHERE s2.run_id = s.run_id
       AND s2.step_index < s.step_index
-      AND s2.status != 'done'
+      AND s2.status NOT IN ('done','skipped')
   )
   AND NOT EXISTS (
     SELECT 1 FROM steps s3
@@ -1324,14 +1517,19 @@ LIMIT 1
         return Ok(None);
     };
 
+    let now = now_rfc3339();
     let updated = tx.execute(
-        "UPDATE steps SET status='running', updated_at=?1 WHERE id=?2 AND status='pending'",
-        (&now_rfc3339(), &step.step_row_id),
+        "UPDATE steps SET status='running', updated_at=?1 WHERE id=?2 AND status IN ('queued','pending')",
+        (&now, &step.step_row_id),
     )?;
     if updated == 0 {
         tx.commit()?;
         return Ok(None);
     }
+    tx.execute(
+        "UPDATE runs SET status='running', updated_at=?1 WHERE id=?2 AND status='queued'",
+        (&now, &step.run_id),
+    )?;
     tx.execute(
         "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'step.running', ?2, ?3)",
         (
@@ -1401,20 +1599,67 @@ fn finalize_step_done(engine: &Engine, step: &PendingStep, out: &str) -> anyhow:
 fn finalize_step_failed(engine: &Engine, step: &PendingStep, err: &str) -> anyhow::Result<()> {
     let mut conn = engine.open()?;
     let tx = conn.transaction()?;
+    let now = now_rfc3339();
+
     tx.execute(
         "UPDATE steps SET status='failed', output_text=?1, updated_at=?2 WHERE id=?3",
-        (err, now_rfc3339(), &step.step_row_id),
+        (err, &now, &step.step_row_id),
     )?;
-    tx.execute(
-        "UPDATE runs SET status='failed', updated_at=?1 WHERE id=?2",
-        (&now_rfc3339(), &step.run_id),
-    )?;
+
+    let mut requeued = false;
+    if step.step_id == "test" {
+        // Antfarm-like fallback loop: if tests fail, re-open implement->review chain with bounded retries.
+        // Guardrail: cap retries to avoid hot loops.
+        let attempts: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM event_log WHERE kind='run.requeued.test_failed' AND entity_id=?1",
+            [&step.run_id],
+            |r| r.get(0),
+        )?;
+        let max_retries = 2_i64;
+        if attempts < max_retries {
+            tx.execute(
+                "UPDATE steps
+                 SET status='queued', output_text=NULL, updated_at=?1
+                 WHERE run_id=?2 AND step_index >= (
+                    SELECT step_index FROM steps WHERE id=?3
+                 )",
+                (&now, &step.run_id, &step.step_row_id),
+            )?;
+            tx.execute(
+                "UPDATE steps
+                 SET status='queued', updated_at=?1
+                 WHERE run_id=?2 AND step_id='implement'",
+                (&now, &step.run_id),
+            )?;
+            tx.execute(
+                "UPDATE runs SET status='running', updated_at=?1 WHERE id=?2",
+                (&now, &step.run_id),
+            )?;
+            tx.execute(
+                "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'run.requeued.test_failed', ?2, ?3)",
+                (
+                    now_ms_i64(),
+                    &step.run_id,
+                    serde_json::json!({ "run_id": step.run_id, "error": err, "attempt": attempts + 1, "max_attempts": max_retries }).to_string(),
+                ),
+            )?;
+            requeued = true;
+        }
+    }
+
+    if !requeued {
+        tx.execute(
+            "UPDATE runs SET status='failed', updated_at=?1 WHERE id=?2",
+            (&now, &step.run_id),
+        )?;
+    }
+
     tx.execute(
         "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'step.failed', ?2, ?3)",
         (
             now_ms_i64(),
             &step.step_row_id,
-            serde_json::json!({ "run_id": step.run_id, "step_id": step.step_id, "error": err }).to_string(),
+            serde_json::json!({ "run_id": step.run_id, "step_id": step.step_id, "error": err, "requeued": requeued }).to_string(),
         ),
     )?;
     tx.commit()?;
@@ -1519,12 +1764,42 @@ fn build_step_message(step: &PendingStep, repo: &str, branch: &str, pr_url: &str
 
 fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
     if repo.trim().is_empty() {
-        anyhow::bail!("missing_repo");
+        anyhow::bail!("missing_repo: run context has no worktree_path");
     }
     if branch.trim().is_empty() {
-        anyhow::bail!("missing_branch");
+        anyhow::bail!("missing_branch: run context has no branch");
     }
-    // Push branch.
+
+    let gh_check = Command::new("gh").arg("--version").output();
+    if gh_check.is_err() {
+        anyhow::bail!(
+            "missing_dependency: gh CLI not installed; install GitHub CLI and run gh auth login"
+        );
+    }
+
+    let auth = Command::new("gh")
+        .arg("auth")
+        .arg("status")
+        .current_dir(repo)
+        .output()?;
+    if !auth.status.success() {
+        anyhow::bail!(
+            "github_auth_required: {}",
+            String::from_utf8_lossy(&auth.stderr).trim()
+        );
+    }
+
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()?;
+    if !remote.status.success() {
+        anyhow::bail!("git_remote_missing: origin remote is required for PR creation");
+    }
+
     let push = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -1534,18 +1809,56 @@ fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
         .arg(branch)
         .output()?;
     if !push.status.success() {
-        anyhow::bail!("git_push_failed: {}", String::from_utf8_lossy(&push.stderr));
+        anyhow::bail!(
+            "git_push_failed: {}",
+            String::from_utf8_lossy(&push.stderr).trim()
+        );
     }
-    // Create PR (requires `gh auth login` already done on the machine).
+
+    let existing = Command::new("gh")
+        .arg("pr")
+        .arg("view")
+        .arg("--head")
+        .arg(branch)
+        .arg("--json")
+        .arg("url")
+        .arg("--jq")
+        .arg(".url")
+        .current_dir(repo)
+        .output()?;
+    if existing.status.success() {
+        let url = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+
+    let base_out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("symbolic-ref")
+        .arg("refs/remotes/origin/HEAD")
+        .output()?;
+    let base_branch = if base_out.status.success() {
+        String::from_utf8_lossy(&base_out.stdout)
+            .trim()
+            .rsplit('/')
+            .next()
+            .unwrap_or("main")
+            .to_string()
+    } else {
+        "main".to_string()
+    };
+
     let title = task.lines().next().unwrap_or("Clawdorio run").trim();
     let body = format!("Clawdorio run for:\n\n{}", task);
     let pr = Command::new("gh")
         .arg("pr")
         .arg("create")
-        .arg("--repo")
-        .arg(".")
         .arg("--head")
         .arg(branch)
+        .arg("--base")
+        .arg(&base_branch)
         .arg("--title")
         .arg(title)
         .arg("--body")
@@ -1553,7 +1866,10 @@ fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
         .current_dir(repo)
         .output()?;
     if !pr.status.success() {
-        anyhow::bail!("gh_pr_create_failed: {}", String::from_utf8_lossy(&pr.stderr));
+        anyhow::bail!(
+            "gh_pr_create_failed: {}",
+            String::from_utf8_lossy(&pr.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&pr.stdout).trim().to_string())
 }
@@ -1576,8 +1892,12 @@ fn repair_belt_paths(engine: &Engine) -> anyhow::Result<()> {
         if raw != "[]" && !raw.is_empty() {
             continue;
         }
-        let Some(a) = ents.iter().find(|e| e.id == b.a_id) else { continue; };
-        let Some(c) = ents.iter().find(|e| e.id == b.b_id) else { continue; };
+        let Some(a) = ents.iter().find(|e| e.id == b.a_id) else {
+            continue;
+        };
+        let Some(c) = ents.iter().find(|e| e.id == b.b_id) else {
+            continue;
+        };
         let path = belt_path_cells(&ents, a, c);
         let path_json = serde_json::to_string(&path).unwrap_or_else(|_| "[]".to_string());
         tx.execute(
@@ -1662,9 +1982,7 @@ fn is_http_origin_for_host(origin: &str, host: &str) -> bool {
 
 fn discover_local_repos() -> Vec<LocalRepo> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let workspace_root = PathBuf::from(home)
-        .join(".openclaw")
-        .join("workspace");
+    let workspace_root = PathBuf::from(home).join(".openclaw").join("workspace");
     let roots = vec![workspace_root];
 
     let skip_dirs: std::collections::HashSet<&'static str> = [

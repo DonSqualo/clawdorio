@@ -179,7 +179,12 @@ impl Engine {
         Ok(Some(ent))
     }
 
-    pub fn update_entity_position(&self, id: &str, x: i64, y: i64) -> anyhow::Result<Option<Entity>> {
+    pub fn update_entity_position(
+        &self,
+        id: &str,
+        x: i64,
+        y: i64,
+    ) -> anyhow::Result<Option<Entity>> {
         let mut conn = self.open()?;
         let tx = conn.transaction()?;
         let now = now_ms();
@@ -415,10 +420,10 @@ impl Engine {
 
     pub fn count_working_agents(&self) -> anyhow::Result<i64> {
         let conn = self.open()?;
-        // Treat "pending" steps as active work. We count distinct agent_id so the number is stable.
+        // Treat queued/pending/running steps as active work. We count distinct agent_id so the number is stable.
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(DISTINCT agent_id) FROM steps WHERE status IN ('pending','running')",
+                "SELECT COUNT(DISTINCT agent_id) FROM steps WHERE status IN ('queued','pending','running')",
                 [],
                 |row| row.get::<_, Option<i64>>(0),
             )?
