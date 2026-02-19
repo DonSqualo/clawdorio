@@ -1,4 +1,5 @@
 use axum::http::header;
+use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::{
     middleware,
@@ -28,6 +29,10 @@ mod tests;
 pub struct AppState {
     pub engine: Engine,
 }
+
+const DEFAULT_AUTO_REBASE_ENABLED: bool = true;
+const DEFAULT_AUTO_REBASE_INTERVAL_SEC: i64 = 900;
+const AUTO_REBASE_MAX_RETRIES: i64 = 3;
 
 pub fn build_router(state: AppState) -> Router {
     let sprites_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -63,9 +68,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/runs/{id}/steps", get(api_run_steps))
         .route("/api/feature/build", post(api_feature_build))
         .route("/api/workers/reemit", post(api_workers_reemit_global))
+        .route("/api/github/webhook", post(api_github_webhook))
         .route(
             "/api/bases/{id}/workers/reemit",
             post(api_workers_reemit_base),
+        )
+        .route("/api/bases/{id}/sync-now", post(api_bases_sync_now))
+        .route(
+            "/api/bases/{id}/auto-rebase",
+            get(api_base_auto_rebase_get).patch(api_base_auto_rebase_patch),
         )
         .nest_service("/rts-sprites", sprites)
         .with_state(Arc::new(state))
@@ -221,6 +232,9 @@ async fn api_entities_create(
             ));
         }
         payload["repo_path"] = serde_json::Value::String(repo_path.to_string());
+        payload["auto_rebase_enabled"] = serde_json::Value::Bool(DEFAULT_AUTO_REBASE_ENABLED);
+        payload["auto_rebase_interval_sec"] =
+            serde_json::Value::Number(DEFAULT_AUTO_REBASE_INTERVAL_SEC.into());
     } else {
         let Some(base_id) = nearest_base_id(&entities, input.x, input.y, fp.0, fp.1, 12) else {
             return Err((
@@ -393,6 +407,13 @@ async fn api_entities_attach_repo(
         ));
     }
     payload["repo_path"] = serde_json::Value::String(repo_path.to_string());
+    if payload.get("auto_rebase_enabled").is_none() {
+        payload["auto_rebase_enabled"] = serde_json::Value::Bool(DEFAULT_AUTO_REBASE_ENABLED);
+    }
+    if payload.get("auto_rebase_interval_sec").is_none() {
+        payload["auto_rebase_interval_sec"] =
+            serde_json::Value::Number(DEFAULT_AUTO_REBASE_INTERVAL_SEC.into());
+    }
     let updated = state
         .engine
         .update_entity_payload(&id, &payload.to_string())
@@ -865,6 +886,145 @@ async fn api_workers_reemit_base(
 }
 
 #[derive(Debug, Serialize)]
+struct AutoRebaseSettingsView {
+    auto_rebase_enabled: bool,
+    auto_rebase_interval_sec: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoRebaseSettingsPatch {
+    auto_rebase_enabled: Option<bool>,
+    auto_rebase_interval_sec: Option<i64>,
+}
+
+async fn api_base_auto_rebase_get(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(base_id): axum::extract::Path<String>,
+) -> Result<Json<AutoRebaseSettingsView>, (axum::http::StatusCode, String)> {
+    let ent = find_base_entity(&state.engine, &base_id)?;
+    let payload = parse_payload(&ent.payload_json);
+    Ok(Json(AutoRebaseSettingsView {
+        auto_rebase_enabled: payload_auto_rebase_enabled(&payload),
+        auto_rebase_interval_sec: payload_auto_rebase_interval_sec(&payload),
+    }))
+}
+
+async fn api_base_auto_rebase_patch(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(base_id): axum::extract::Path<String>,
+    Json(input): Json<AutoRebaseSettingsPatch>,
+) -> Result<Json<AutoRebaseSettingsView>, (axum::http::StatusCode, String)> {
+    let ent = find_base_entity(&state.engine, &base_id)?;
+    let mut payload = parse_payload(&ent.payload_json);
+    if let Some(v) = input.auto_rebase_enabled {
+        payload["auto_rebase_enabled"] = serde_json::Value::Bool(v);
+    }
+    if let Some(v) = input.auto_rebase_interval_sec {
+        if v < 30 {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "auto_rebase_interval_sec must be >= 30".to_string(),
+            ));
+        }
+        payload["auto_rebase_interval_sec"] = serde_json::Value::Number(v.into());
+    }
+    state
+        .engine
+        .update_entity_payload(&base_id, &payload.to_string())
+        .map_err(internal_error("engine.update_entity_payload"))?;
+    Ok(Json(AutoRebaseSettingsView {
+        auto_rebase_enabled: payload_auto_rebase_enabled(&payload),
+        auto_rebase_interval_sec: payload_auto_rebase_interval_sec(&payload),
+    }))
+}
+
+async fn api_bases_sync_now(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(base_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let queued = queue_base_rebase_sweep(&state.engine, &base_id, "manual.sync_now", None)
+        .map_err(internal_error("queue_base_rebase_sweep"))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "base_id": base_id, "queued": queued }),
+    ))
+}
+
+async fn api_github_webhook(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let event = headers
+        .get("x-github-event")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    let repo_full = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mut queued = 0usize;
+
+    if event == "push" {
+        let ref_name = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+        let after = payload.get("after").and_then(|v| v.as_str());
+        for base in matching_bases_by_repo(&state.engine, repo_full)
+            .map_err(internal_error("matching_bases_by_repo"))?
+        {
+            let default = detect_default_branch(
+                &repo_path_from_payload(&parse_payload(&base.payload_json)).unwrap_or_default(),
+            )
+            .unwrap_or_else(|_| "main".to_string());
+            if ref_name == format!("refs/heads/{default}") {
+                if queue_base_rebase_sweep(&state.engine, &base.id, "webhook.push", after)
+                    .map_err(internal_error("queue_base_rebase_sweep"))?
+                {
+                    queued += 1;
+                }
+            }
+        }
+    }
+
+    if event == "pull_request" {
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let merged = payload
+            .get("pull_request")
+            .and_then(|v| v.get("merged"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let should = matches!(action, "synchronize" | "opened" | "reopened")
+            || (action == "closed" && merged);
+        if should {
+            let upstream_sha = payload
+                .get("pull_request")
+                .and_then(|v| v.get("base"))
+                .and_then(|v| v.get("sha"))
+                .and_then(|v| v.as_str());
+            for base in matching_bases_by_repo(&state.engine, repo_full)
+                .map_err(internal_error("matching_bases_by_repo"))?
+            {
+                if queue_base_rebase_sweep(
+                    &state.engine,
+                    &base.id,
+                    "webhook.pull_request",
+                    upstream_sha,
+                )
+                .map_err(internal_error("queue_base_rebase_sweep"))?
+                {
+                    queued += 1;
+                }
+            }
+        }
+    }
+
+    Ok(Json(
+        serde_json::json!({"ok": true, "event": event, "queued": queued}),
+    ))
+}
+
+#[derive(Debug, Serialize)]
 struct ReemitReport {
     scanned_runs: usize,
     queued_steps: usize,
@@ -991,6 +1151,188 @@ fn reemit_workers(engine: &Engine, base_id: Option<&str>) -> anyhow::Result<Reem
         reset_running_steps,
         touched_runs,
     })
+}
+
+fn parse_payload(payload_json: &str) -> serde_json::Value {
+    serde_json::from_str(payload_json).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn repo_path_from_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn payload_auto_rebase_enabled(payload: &serde_json::Value) -> bool {
+    payload
+        .get("auto_rebase_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_AUTO_REBASE_ENABLED)
+}
+
+fn payload_auto_rebase_interval_sec(payload: &serde_json::Value) -> i64 {
+    payload
+        .get("auto_rebase_interval_sec")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v >= 30)
+        .unwrap_or(DEFAULT_AUTO_REBASE_INTERVAL_SEC)
+}
+
+fn find_base_entity(
+    engine: &Engine,
+    base_id: &str,
+) -> Result<Entity, (axum::http::StatusCode, String)> {
+    let entities = engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    let Some(ent) = entities
+        .into_iter()
+        .find(|e| e.id == base_id && e.kind == "base")
+    else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "base_not_found".to_string(),
+        ));
+    };
+    Ok(ent)
+}
+
+fn matching_bases_by_repo(engine: &Engine, full_name: &str) -> anyhow::Result<Vec<Entity>> {
+    if full_name.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let entities = engine.list_entities()?;
+    let mut out = vec![];
+    for base in entities.into_iter().filter(|e| e.kind == "base") {
+        let payload = parse_payload(&base.payload_json);
+        let Some(repo_path) = repo_path_from_payload(&payload) else {
+            continue;
+        };
+        if let Ok(name) = repo_full_name(&repo_path) {
+            if name == full_name {
+                out.push(base);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn repo_full_name(repo: &str) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("git_remote_missing");
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    parse_github_full_name(&url).ok_or_else(|| anyhow::anyhow!("repo_parse_failed"))
+}
+
+fn parse_github_full_name(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches(".git");
+    if let Some(rest) = u.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    if let Some(i) = u.find("github.com/") {
+        return Some(u[(i + "github.com/".len())..].to_string());
+    }
+    None
+}
+
+fn queue_base_rebase_sweep(
+    engine: &Engine,
+    base_id: &str,
+    reason: &str,
+    upstream_sha: Option<&str>,
+) -> anyhow::Result<bool> {
+    let ent = find_base_entity(engine, base_id).map_err(|(_, e)| anyhow::anyhow!(e))?;
+    let mut payload = parse_payload(&ent.payload_json);
+    if !payload_auto_rebase_enabled(&payload) {
+        return Ok(false);
+    }
+    let repo =
+        repo_path_from_payload(&payload).ok_or_else(|| anyhow::anyhow!("base_repo_missing"))?;
+    let default_branch = detect_default_branch(&repo).unwrap_or_else(|_| "main".to_string());
+    let now_ms = now_ms_i64();
+    let interval_ms = payload_auto_rebase_interval_sec(&payload) * 1000;
+
+    let conn = engine.open()?;
+    let running_or_queued: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM runs WHERE workflow_id='auto-rebase' AND entity_id=?1 AND status IN ('queued','running')",
+        [base_id],
+        |r| r.get(0),
+    )?;
+    if running_or_queued > 0 {
+        return Ok(false);
+    }
+
+    let last_enqueued_ms = payload
+        .get("auto_rebase_last_enqueued_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if now_ms - last_enqueued_ms < interval_ms / 2 {
+        return Ok(false);
+    }
+
+    let ts = now_rfc3339();
+    let run_id = format!("run-auto-rebase-{}", now_ms);
+    let ctx = serde_json::json!({
+        "action": "auto_rebase_sweep",
+        "base_id": base_id,
+        "base_repo_path": repo,
+        "default_branch": default_branch,
+        "trigger_reason": reason,
+        "upstream_sha": upstream_sha.unwrap_or(""),
+    })
+    .to_string();
+
+    conn.execute(
+        "INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at)
+         VALUES (?1, 'auto-rebase', ?2, 'queued', ?3, ?4, ?5, ?5)",
+        (&run_id, &format!("Auto-rebase sweep for base {base_id}"), &base_id, &ctx, &ts),
+    )?;
+    conn.execute(
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status, input_json, output_text, created_at, updated_at)
+         VALUES (?1, ?2, 'auto-rebase', 'internal/pr', 0, 'queued', ?3, NULL, ?4, ?4)",
+        (format!("step-{run_id}"), &run_id, &ctx, &ts),
+    )?;
+    conn.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'auto_rebase.queued', ?2, ?3)",
+        (
+            now_ms,
+            base_id,
+            serde_json::json!({"run_id": run_id, "reason": reason, "upstream_sha": upstream_sha.unwrap_or("")}).to_string(),
+        ),
+    )?;
+
+    payload["auto_rebase_last_enqueued_ms"] = serde_json::Value::Number(now_ms.into());
+    let _ = engine.update_entity_payload(base_id, &payload.to_string())?;
+
+    Ok(true)
+}
+
+fn detect_default_branch(repo: &str) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("symbolic-ref")
+        .arg("refs/remotes/origin/HEAD")
+        .output()?;
+    if !out.status.success() {
+        return Ok("main".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or("main")
+        .to_string())
 }
 
 fn internal_error(
@@ -1442,8 +1784,66 @@ async fn runloop(engine: Engine) {
             }
         }
 
+        if idle_loops % 20 == 0 {
+            let eng = engine.clone();
+            let _ = tokio::task::spawn_blocking(move || periodic_rebase_reconciler(&eng)).await;
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
+}
+
+fn periodic_rebase_reconciler(engine: &Engine) -> anyhow::Result<()> {
+    let entities = engine.list_entities()?;
+    for base in entities.into_iter().filter(|e| e.kind == "base") {
+        let mut payload = parse_payload(&base.payload_json);
+        if !payload_auto_rebase_enabled(&payload) {
+            continue;
+        }
+        let Some(repo) = repo_path_from_payload(&payload) else {
+            continue;
+        };
+        let default_branch = detect_default_branch(&repo).unwrap_or_else(|_| "main".to_string());
+        let head = git_remote_head_sha(&repo, &default_branch).unwrap_or_default();
+        if head.is_empty() {
+            continue;
+        }
+        let last_head = payload
+            .get("auto_rebase_last_default_head")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let interval_ms = payload_auto_rebase_interval_sec(&payload) * 1000;
+        let last_ms = payload
+            .get("auto_rebase_last_reconcile_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let now = now_ms_i64();
+        let moved = last_head != head;
+        let due = now - last_ms >= interval_ms;
+        if moved && due {
+            let _ = queue_base_rebase_sweep(engine, &base.id, "periodic.reconciler", Some(&head));
+            payload["auto_rebase_last_default_head"] = serde_json::Value::String(head.clone());
+            payload["auto_rebase_last_reconcile_ms"] = serde_json::Value::Number(now.into());
+            let _ = engine.update_entity_payload(&base.id, &payload.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn git_remote_head_sha(repo: &str, branch: &str) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("ls-remote")
+        .arg("origin")
+        .arg(format!("refs/heads/{branch}"))
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("git_ls_remote_failed");
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    Ok(line.split_whitespace().next().unwrap_or("").to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1686,6 +2086,10 @@ fn execute_step_blocking(engine: &Engine, step: &PendingStep) -> anyhow::Result<
         .to_string();
 
     if step.agent_id == "internal/pr" {
+        let action = ctx.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if action == "auto_rebase_sweep" {
+            return execute_auto_rebase_sweep(engine, step, &ctx);
+        }
         let url = create_pr(&repo, &branch, &step.task)?;
         // Persist PR URL into run context for review step.
         let mut conn = engine.open()?;
@@ -1872,6 +2276,165 @@ fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&pr.stdout).trim().to_string())
+}
+
+fn execute_auto_rebase_sweep(
+    engine: &Engine,
+    step: &PendingStep,
+    ctx: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let base_id = ctx
+        .get("base_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing_base_id"))?;
+    let repo = ctx
+        .get("base_repo_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing_base_repo_path"))?;
+    let default_branch = ctx
+        .get("default_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main");
+
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("fetch")
+        .arg("origin")
+        .output()?;
+    if !fetch.status.success() {
+        anyhow::bail!(
+            "git_fetch_failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+
+    let pr_list = Command::new("gh")
+        .arg("pr")
+        .arg("list")
+        .arg("--state")
+        .arg("open")
+        .arg("--json")
+        .arg("headRefName")
+        .current_dir(repo)
+        .output()?;
+    if !pr_list.status.success() {
+        anyhow::bail!(
+            "gh_pr_list_failed: {}",
+            String::from_utf8_lossy(&pr_list.stderr).trim()
+        );
+    }
+    let prs: serde_json::Value =
+        serde_json::from_slice(&pr_list.stdout).unwrap_or_else(|_| serde_json::json!([]));
+    let branches: Vec<String> = prs
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            v.get("headRefName")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|b| b.starts_with("clawdorio/"))
+        .collect();
+
+    let mut ok_branches: Vec<String> = vec![];
+    let mut failed: Vec<String> = vec![];
+
+    for branch in branches {
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("checkout")
+            .arg(&branch)
+            .output()?;
+        if !checkout.status.success() {
+            failed.push(format!("{branch}: checkout failed"));
+            continue;
+        }
+
+        let rebase = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("rebase")
+            .arg(format!("origin/{default_branch}"))
+            .output()?;
+        if !rebase.status.success() {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .arg("rebase")
+                .arg("--abort")
+                .output();
+            failed.push(format!(
+                "{branch}: rebase conflict: {}",
+                String::from_utf8_lossy(&rebase.stderr).trim()
+            ));
+            continue;
+        }
+
+        let push = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("push")
+            .arg("--force-with-lease")
+            .arg("origin")
+            .arg(&branch)
+            .output()?;
+        if !push.status.success() {
+            failed.push(format!(
+                "{branch}: push failed: {}",
+                String::from_utf8_lossy(&push.stderr).trim()
+            ));
+            continue;
+        }
+        ok_branches.push(branch);
+    }
+
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'auto_rebase.result', ?2, ?3)",
+        (
+            now_ms_i64(),
+            base_id,
+            serde_json::json!({
+                "run_id": step.run_id,
+                "rebased": ok_branches,
+                "failed": failed,
+            })
+            .to_string(),
+        ),
+    )?;
+
+    // Bounded retries/backoff for conflicts.
+    if !failed.is_empty() {
+        let attempts: i64 = tx
+            .query_row(
+                "SELECT COALESCE(json_extract(context_json, '$.auto_rebase_attempt'), 0) FROM runs WHERE id=?1",
+                [&step.run_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if attempts < AUTO_REBASE_MAX_RETRIES {
+            let backoff = (attempts + 1) * 30;
+            let mut v = ctx.clone();
+            v["auto_rebase_attempt"] = serde_json::Value::Number((attempts + 1).into());
+            v["auto_rebase_backoff_sec"] = serde_json::Value::Number(backoff.into());
+            tx.execute(
+                "UPDATE runs SET context_json=?1, updated_at=?2 WHERE id=?3",
+                (v.to_string(), now_rfc3339(), &step.run_id),
+            )?;
+        }
+    }
+    tx.commit()?;
+
+    if failed.is_empty() {
+        Ok("auto-rebase completed".to_string())
+    } else {
+        anyhow::bail!("needs-attention: {}", failed.join(" | "))
+    }
 }
 
 fn repair_belt_paths(engine: &Engine) -> anyhow::Result<()> {

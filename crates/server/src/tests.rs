@@ -1,4 +1,7 @@
 use super::*;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::Json;
+use std::sync::Arc;
 
 fn temp_engine() -> Engine {
     let p = std::env::temp_dir().join(format!(
@@ -122,4 +125,237 @@ fn reemit_workers_scoped_to_base() {
         .unwrap();
     assert_eq!(sa, "queued");
     assert_eq!(sb, "running");
+}
+
+fn init_git_repo() -> std::path::PathBuf {
+    let repo = std::env::temp_dir().join(format!(
+        "clawdorio-server-git-{}",
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    std::fs::create_dir_all(&repo).unwrap();
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("config")
+        .arg("user.email")
+        .arg("test@example.com")
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("config")
+        .arg("user.name")
+        .arg("Test")
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::fs::write(
+        repo.join("README.md"),
+        "x
+",
+    )
+    .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+
+    let bare = repo.with_extension("origin.git");
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg(&bare)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["remote", "add", "origin", bare.to_string_lossy().as_ref()])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["push", "-u", "origin", "main"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+
+    repo
+}
+
+#[test]
+fn sync_now_queues_once_idempotent() {
+    let engine = temp_engine();
+    let repo = init_git_repo();
+    engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({
+                "repo_path": repo.to_string_lossy().to_string(),
+                "auto_rebase_enabled": true,
+                "auto_rebase_interval_sec": 120,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let base = engine
+        .list_entities()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "base")
+        .unwrap();
+
+    assert!(queue_base_rebase_sweep(&engine, &base.id, "test", None).unwrap());
+    assert!(!queue_base_rebase_sweep(&engine, &base.id, "test", None).unwrap());
+
+    let conn = engine.open().unwrap();
+    let c: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE workflow_id='auto-rebase' AND entity_id=?1",
+            [&base.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(c, 1);
+}
+
+#[test]
+fn periodic_reconciler_skips_when_disabled() {
+    let engine = temp_engine();
+    let repo = init_git_repo();
+    let _ = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({
+                "repo_path": repo.to_string_lossy().to_string(),
+                "auto_rebase_enabled": false,
+                "auto_rebase_interval_sec": 30,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+    periodic_rebase_reconciler(&engine).unwrap();
+    let conn = engine.open().unwrap();
+    let c: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE workflow_id='auto-rebase'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(c, 0);
+}
+
+#[tokio::test]
+async fn manual_sync_handler_queues_run() {
+    let engine = temp_engine();
+    let repo = init_git_repo();
+    let base = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({
+                "repo_path": repo.to_string_lossy().to_string(),
+                "auto_rebase_enabled": true,
+                "auto_rebase_interval_sec": 120,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let state = Arc::new(AppState {
+        engine: engine.clone(),
+    });
+    let _ = api_bases_sync_now(
+        axum::extract::State(state),
+        axum::extract::Path(base.id.clone()),
+    )
+    .await
+    .unwrap();
+
+    let conn = engine.open().unwrap();
+    let c: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE workflow_id='auto-rebase' AND entity_id=?1",
+            [&base.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(c, 1);
+}
+
+#[tokio::test]
+async fn webhook_push_queues_auto_rebase() {
+    let engine = temp_engine();
+    let repo = init_git_repo();
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/demo.git",
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+
+    let base = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({
+                "repo_path": repo.to_string_lossy().to_string(),
+                "auto_rebase_enabled": true,
+                "auto_rebase_interval_sec": 120,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+    let state = Arc::new(AppState {
+        engine: engine.clone(),
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert("x-github-event", HeaderValue::from_static("push"));
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "abc123",
+        "repository": { "full_name": "acme/demo" }
+    });
+    let _ = api_github_webhook(axum::extract::State(state), headers, Json(payload))
+        .await
+        .unwrap();
+
+    let conn = engine.open().unwrap();
+    let c: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE workflow_id='auto-rebase' AND entity_id=?1",
+            [&base.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(c, 1);
 }

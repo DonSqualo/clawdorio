@@ -41,3 +41,7 @@ cargo run -p clawdorio-server -- --host 0.0.0.0 --port 39333
 npm install
 npm run tauri dev
 ```
+
+## Internal pipeline docs
+
+- PR creation + auto-rebase path: `crates/server/PR_CREATION_AGENT.md`
