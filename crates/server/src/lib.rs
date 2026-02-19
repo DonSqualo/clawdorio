@@ -66,6 +66,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/quests/{id}", delete(api_quests_delete))
         .route("/api/runs", get(api_runs_list))
         .route("/api/runs/{id}/steps", get(api_run_steps))
+        .route("/api/pr-feed", get(api_pr_feed))
+        .route("/api/pr-feed/{run_id}/files", get(api_pr_feed_files))
+        .route("/api/prs/comment", post(api_pr_comment))
         .route("/api/feature/build", post(api_feature_build))
         .route("/api/workers/reemit", post(api_workers_reemit_global))
         .route("/api/github/webhook", post(api_github_webhook))
@@ -647,6 +650,495 @@ async fn api_run_steps(
             )
         })?;
     Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrFeedQuery {
+    #[serde(default)]
+    base_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrFileView {
+    path: String,
+    additions: i64,
+    deletions: i64,
+    snippet: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PrChangedSummary {
+    total_files: usize,
+    sample: Vec<String>,
+    source: String,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrCard {
+    run_id: String,
+    factory_id: Option<String>,
+    base_id: Option<String>,
+    repo: Option<String>,
+    pr_url: Option<String>,
+    pr_number: Option<i64>,
+    branch: Option<String>,
+    status: String,
+    updated_at: String,
+    title: String,
+    changed_files: PrChangedSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrFilesQuery {
+    #[serde(default)]
+    max_patch_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrCommentInput {
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    pr_url: Option<String>,
+    #[serde(default)]
+    pr_number: Option<i64>,
+    comment: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+async fn api_pr_feed(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<PrFeedQuery>,
+) -> Result<Json<Vec<PrCard>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, entity_id, status, task, context_json, updated_at
+             FROM runs
+             ORDER BY updated_at DESC
+             LIMIT 120",
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.prepare_pr_feed: {e}"),
+            )
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query_pr_feed: {e}"),
+            )
+        })?;
+
+    let entities = state
+        .engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    let limit = q.limit.unwrap_or(30).clamp(1, 100);
+    let mut cards = Vec::new();
+
+    for (run_id, factory_id, status, task, ctx, updated_at) in rows.filter_map(Result::ok) {
+        if cards.len() >= limit {
+            break;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&ctx).unwrap_or_else(|_| serde_json::json!({}));
+        let pr_url = v
+            .get("pr_url")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let branch = v
+            .get("branch")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if pr_url.is_none() && branch.is_none() {
+            continue;
+        }
+
+        let base_id = factory_id
+            .as_ref()
+            .and_then(|id| entities.iter().find(|e| &e.id == id))
+            .and_then(payload_base_id);
+        if q.base_id.as_deref().is_some() && q.base_id.as_deref() != base_id.as_deref() {
+            continue;
+        }
+
+        let repo = v
+            .get("base_repo_path")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let pr_number = v
+            .get("pr_number")
+            .and_then(|x| x.as_i64())
+            .or_else(|| pr_url.as_deref().and_then(parse_pr_number_from_url));
+
+        let changed_files = if let (Some(repo), Some(num)) = (repo.as_deref(), pr_number) {
+            match gh_pr_changed_files_summary(repo, &num.to_string()) {
+                Ok(v) => v,
+                Err(e) => PrChangedSummary {
+                    total_files: 0,
+                    sample: vec![],
+                    source: "fallback".to_string(),
+                    warning: Some(e),
+                },
+            }
+        } else {
+            PrChangedSummary {
+                total_files: 0,
+                sample: vec![],
+                source: "fallback".to_string(),
+                warning: Some("missing_pr_context".to_string()),
+            }
+        };
+
+        cards.push(PrCard {
+            run_id,
+            factory_id,
+            base_id,
+            repo,
+            pr_url,
+            pr_number,
+            branch,
+            status,
+            updated_at,
+            title: task
+                .lines()
+                .next()
+                .unwrap_or(task.as_str())
+                .trim()
+                .to_string(),
+            changed_files,
+        });
+    }
+    Ok(Json(cards))
+}
+
+async fn api_pr_feed_files(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PrFilesQuery>,
+) -> Result<Json<Vec<PrFileView>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let ctx_raw: Option<String> = conn
+        .query_row(
+            "SELECT context_json FROM runs WHERE id=?1",
+            [&run_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(ctx_raw) = ctx_raw else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "run_not_found".to_string(),
+        ));
+    };
+    let ctx: serde_json::Value =
+        serde_json::from_str(&ctx_raw).unwrap_or_else(|_| serde_json::json!({}));
+    let repo = ctx.get("base_repo_path").and_then(|x| x.as_str()).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "base_repo_missing".to_string(),
+    ))?;
+    let pr_selector = ctx
+        .get("pr_number")
+        .and_then(|x| x.as_i64())
+        .map(|n| n.to_string())
+        .or_else(|| {
+            ctx.get("pr_url")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .ok_or((
+            axum::http::StatusCode::BAD_REQUEST,
+            "pr_missing".to_string(),
+        ))?;
+
+    let files = gh_pr_file_snippets(
+        repo,
+        &pr_selector,
+        q.max_patch_chars.unwrap_or(1600).clamp(200, 8000),
+    )
+    .map_err(|e| (axum::http::StatusCode::FAILED_DEPENDENCY, e))?;
+    Ok(Json(files))
+}
+
+async fn api_pr_comment(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<PrCommentInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let comment = input.comment.trim();
+    if comment.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "comment_required".to_string(),
+        ));
+    }
+
+    let mut conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let tx = conn.transaction().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.transaction: {e}"),
+        )
+    })?;
+
+    if let Some(key) = input
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let prev: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE kind='pr.comment.reemit' AND json_extract(payload_json, '$.idempotency_key')=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if prev > 0 {
+            tx.commit().ok();
+            return Ok(Json(
+                serde_json::json!({"ok": true, "idempotent_replay": true}),
+            ));
+        }
+    }
+
+    let run_rows: Vec<(String, Option<String>, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, entity_id, context_json FROM runs ORDER BY updated_at DESC LIMIT 200",
+            )
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("db.prepare_run_lookup: {e}"),
+                )
+            })?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("db.query_run_lookup: {e}"),
+                )
+            })?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let mut matched: Option<(String, Option<String>)> = None;
+    for (run_id, entity_id, ctx_raw) in run_rows {
+        if input.run_id.as_deref() == Some(run_id.as_str()) {
+            matched = Some((run_id, entity_id));
+            break;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&ctx_raw).unwrap_or_else(|_| serde_json::json!({}));
+        let pr_url = v.get("pr_url").and_then(|x| x.as_str());
+        let pr_number = v
+            .get("pr_number")
+            .and_then(|x| x.as_i64())
+            .or_else(|| pr_url.and_then(parse_pr_number_from_url));
+        if input.pr_url.as_deref() == pr_url
+            || (input.pr_number.is_some() && input.pr_number == pr_number)
+        {
+            matched = Some((run_id, entity_id));
+            break;
+        }
+    }
+
+    let Some((run_id, factory_id)) = matched else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "no_linked_factory_or_run: pass run_id or PR reference".to_string(),
+        ));
+    };
+
+    let entities = state
+        .engine
+        .list_entities()
+        .map_err(internal_error("engine.list_entities"))?;
+    let base_id = factory_id
+        .as_ref()
+        .and_then(|id| entities.iter().find(|e| &e.id == id))
+        .and_then(payload_base_id);
+
+    if let Some(ref b) = base_id {
+        let last_ts: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(ts_ms) FROM event_log WHERE kind='pr.comment.reemit' AND json_extract(payload_json, '$.base_id')=?1",
+                [b],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(last) = last_ts {
+            let elapsed = now_ms_i64() - last;
+            if elapsed < 15_000 {
+                return Err((
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    format!("rate_limited: retry_after_ms={}", 15_000 - elapsed),
+                ));
+            }
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'pr.comment.reemit', ?2, ?3)",
+        (
+            now_ms_i64(),
+            &run_id,
+            serde_json::json!({
+                "run_id": run_id,
+                "factory_id": factory_id,
+                "base_id": base_id,
+                "comment": comment,
+                "idempotency_key": input.idempotency_key,
+            })
+            .to_string(),
+        ),
+    )
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.insert_comment_event: {e}")))?;
+    tx.commit().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.commit_comment_event: {e}"),
+        )
+    })?;
+
+    let report = reemit_workers(&state.engine, base_id.as_deref())
+        .map_err(internal_error("reemit_workers"))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "run_id": run_id,
+        "base_id": base_id,
+        "scope": if base_id.is_some() { "base" } else { "global" },
+        "report": report,
+        "idempotent_replay": false,
+    })))
+}
+
+fn parse_pr_number_from_url(url: &str) -> Option<i64> {
+    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
+    if parts.len() < 2 || parts[parts.len() - 2] != "pull" {
+        return None;
+    }
+    parts.last()?.parse::<i64>().ok()
+}
+
+fn gh_pr_changed_files_summary(repo: &str, selector: &str) -> Result<PrChangedSummary, String> {
+    let out = Command::new("gh")
+        .arg("pr")
+        .arg("view")
+        .arg(selector)
+        .arg("--json")
+        .arg("files")
+        .current_dir(repo)
+        .output()
+        .map_err(|_| "gh_missing: install gh and run gh auth login".to_string())?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.to_lowercase().contains("not logged")
+            || stderr.to_lowercase().contains("authentication")
+        {
+            return Err(format!("github_auth_required: {stderr}"));
+        }
+        return Err(format!("gh_pr_view_failed: {stderr}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|_| serde_json::json!({}));
+    let files = v
+        .get("files")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(PrChangedSummary {
+        total_files: files.len(),
+        sample: files
+            .iter()
+            .filter_map(|f| {
+                f.get("path")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            })
+            .take(5)
+            .collect(),
+        source: "gh".to_string(),
+        warning: None,
+    })
+}
+
+fn gh_pr_file_snippets(
+    repo: &str,
+    selector: &str,
+    max_patch_chars: usize,
+) -> Result<Vec<PrFileView>, String> {
+    let out = Command::new("gh")
+        .arg("pr")
+        .arg("view")
+        .arg(selector)
+        .arg("--json")
+        .arg("files")
+        .current_dir(repo)
+        .output()
+        .map_err(|_| "gh_missing: install gh and run gh auth login".to_string())?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.to_lowercase().contains("not logged")
+            || stderr.to_lowercase().contains("authentication")
+        {
+            return Err(format!("github_auth_required: {stderr}"));
+        }
+        if stderr.to_lowercase().contains("forbidden")
+            || stderr.to_lowercase().contains("resource not accessible")
+        {
+            return Err(format!("github_permission_required: {stderr}"));
+        }
+        return Err(format!("gh_pr_view_failed: {stderr}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|_| serde_json::json!({}));
+    let files = v
+        .get("files")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(files
+        .into_iter()
+        .map(|f| PrFileView {
+            path: f
+                .get("path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            additions: f.get("additions").and_then(|x| x.as_i64()).unwrap_or(0),
+            deletions: f.get("deletions").and_then(|x| x.as_i64()).unwrap_or(0),
+            snippet: f
+                .get("patch")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .chars()
+                .take(max_patch_chars)
+                .collect(),
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1957,6 +2449,11 @@ fn now_ms_i64() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn has_gh_auth() -> bool {
+    let out = Command::new("gh").arg("auth").arg("status").output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
 fn finalize_step_done(engine: &Engine, step: &PendingStep, out: &str) -> anyhow::Result<()> {
     let mut conn = engine.open()?;
     let tx = conn.transaction()?;
@@ -2896,10 +3393,31 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       pointer-events:none;
     }
 
+    .mobile-tabs,.mobile-build-drawer,.mobile-runs{display:none}
+    .pr-feed{display:flex;gap:10px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px}
+    .pr-card{min-width:min(88vw,520px);scroll-snap-align:start;border:1px solid #4f799f88;background:#061325dd;padding:10px}
+    .pr-card h4{font-size:12px;margin-bottom:6px;font-family:Orbitron,system-ui,sans-serif}
+    .pr-files{max-height:180px;overflow:auto;border:1px solid #4f799f55;background:#040b16;padding:8px;margin-top:8px}
+    .pr-file{font-size:11px;color:#cfefff;margin-bottom:8px}
+    .pr-file pre{white-space:pre-wrap;word-break:break-word;color:#9fd3ff;background:#061325;padding:6px;border:1px solid #28557d}
+
     /* Small screens: collapse to single column */
     @media (max-width: 980px){
-      :root{--dock-w: min(320px, 92vw);}
-      .commandbar{grid-template-columns:1fr}
+      :root{--dock-w: min(320px, 92vw);--command-h:200px;}
+      .hud{top:8px;left:8px;gap:8px}
+      .hudbtn{width:44px;height:44px;font-size:14px}
+      .viewport{top:0;left:0;right:0;bottom:58px;border-left:0;border-right:0}
+      .commandbar{display:none;left:0;right:0;bottom:58px;height:220px;border-left:0;border-right:0;padding:10px}
+      .mobile-tabs{position:absolute;left:0;right:0;bottom:0;height:58px;display:grid;grid-template-columns:repeat(4,1fr);z-index:90;border-top:1px solid var(--panel-edge);background:#081427f5}
+      .mobile-tabs .tab{border:0;border-right:1px solid #1f4466;background:transparent;color:var(--ice);font-size:12px;font-weight:700;touch-action:manipulation}
+      .mobile-tabs .tab:last-child{border-right:0}
+      .mobile-tabs .tab.active{background:#0d2a46;color:#6ff8ff}
+      .mobile-build-drawer{position:absolute;left:0;right:0;bottom:58px;z-index:88;border-top:1px solid var(--panel-edge);background:#081427f5;padding:8px}
+      .mobile-build-title{font-size:11px;color:var(--muted);margin-bottom:6px}
+      .palette.mobile{display:flex;overflow-x:auto;gap:8px;height:120px;padding:2px}
+      .palette.mobile .palette-card{min-width:120px;height:110px}
+      .mobile-runs{position:absolute;left:0;right:0;bottom:58px;top:56px;z-index:70;padding:8px;background:#061325f0;overflow:hidden}
+      .dock.right{top:56px;bottom:58px;left:0;right:0;width:auto;border-left:0;border-right:0;z-index:75}
     }
   </style>
 </head>
@@ -2912,7 +3430,14 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       <button id="hudQuest" class="hudbtn" type="button" aria-label="Questbook">Q</button>
     </div>
 
-    <main class="viewport">
+    <nav class="mobile-tabs" id="mobileTabs" aria-label="Mobile navigation">
+      <button class="tab active" data-tab="base" type="button">Base</button>
+      <button class="tab" data-tab="build" type="button">Build</button>
+      <button class="tab" data-tab="runs" type="button">Runs/PRs</button>
+      <button class="tab" data-tab="quest" type="button">Questbook</button>
+    </nav>
+
+    <main class="viewport" id="baseView">
       <canvas id="rtsCanvas"></canvas>
     </main>
 
@@ -2939,13 +3464,20 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       </div>
     </aside>
 
-	    <footer class="commandbar">
-	      <section class="palette-wrap">
+	    <footer class="commandbar" id="commandbar">
+	      <section class="palette-wrap" id="paletteWrap">
 	        <div class="palette" id="palette" aria-label="Building palette"></div>
 	      </section>
 	      <section class="bottompanel" id="panel.bottom.bar" aria-label="Selection bottom panel">
 	      </section>
 	    </footer>
+	    <section class="mobile-build-drawer" id="mobileBuildDrawer" aria-label="Build drawer">
+	      <div class="mobile-build-title">Build Palette</div>
+	      <div class="palette mobile" id="mobilePalette" aria-label="Mobile building palette"></div>
+	    </section>
+	    <section class="mobile-runs" id="mobileRuns" aria-label="PR feed">
+	      <div id="prFeed" class="pr-feed"></div>
+	    </section>
 	    <div id="baseCreateModal" style="display:none; position:absolute; left:var(--screen-pad); right:var(--screen-pad); bottom:calc(var(--screen-pad) + var(--command-h) + 12px); z-index:80; border:0; background:#081427f0; padding:12px; box-shadow:0 18px 48px #000b;">
 	      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
 	        <div style="font-family:Orbitron,system-ui,sans-serif; font-size:12px; letter-spacing:.6px;">Choose Repo For Base</div>
@@ -2974,8 +3506,13 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     const questNewEl = $("questNew");
     const questDeleteEl = $("questDelete");
 	    const paletteEl = $("palette");
+	    const mobilePaletteEl = $("mobilePalette");
 	    const bottomPanel = $("panel.bottom.bar");
 	    const commandbarEl = document.querySelector(".commandbar");
+	    const mobileTabsEl = $("mobileTabs");
+	    const mobileBuildDrawerEl = $("mobileBuildDrawer");
+	    const mobileRunsEl = $("mobileRuns");
+	    const prFeedEl = $("prFeed");
 	    const baseCreateModalEl = $("baseCreateModal");
 	    const baseRepoSelectEl = $("baseRepoSelect");
 	    const baseCreatePlaceEl = $("baseCreatePlace");
@@ -2995,6 +3532,8 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    let belts = [];
 	    let selectedBeltId = null;
 	    let beltOcc = new Set(); // "x,y" occupied by belt segments (1x1 cells)
+	    let mobileTab = "base";
+	    let prFeedCards = [];
 
 	    function showBaseModal(show){
 	      if (!baseCreateModalEl) return;
@@ -3058,47 +3597,52 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }
 
     function renderPalette(){
-      paletteEl.innerHTML = "";
-      for (const b of BUILDINGS){
-        const btn = document.createElement("button");
-        btn.className = "palette-card";
-        btn.type = "button";
-        btn.draggable = true;
-        btn.title = `${b.title} (${b.hotkey})`;
-	        btn.style.setProperty("--palette-bg", `url('${b.preview}')`);
-	        btn.innerHTML = `
-	          <span class="palette-tooltip" role="tooltip">
-	            <span class="tooltip-title">${esc(b.title)}</span>
-	            <span class="tooltip-copy">${esc(b.copy || "")}</span>
-	            <span class="tooltip-copy" style="margin-top:6px;">${esc(b.w)}x${esc(b.h)} | ${esc(String(b.hotkey || "").toUpperCase())}</span>
-	          </span>
-	          <span class="hotkey">${esc(b.hotkey)}</span>
-	        `;
-        btn.addEventListener("click", () => {
-          draftKind = b.kind;
-          selected = null;
-          updatePaletteActive();
-          renderBottomPanel();
-          requestDraw();
-        });
-        btn.addEventListener("dragstart", (e) => {
-          draftKind = b.kind;
-          updatePaletteActive();
-          if (e.dataTransfer){
-            e.dataTransfer.setData("text/plain", b.kind);
-            e.dataTransfer.effectAllowed = "copy";
-          }
-        });
-        paletteEl.appendChild(btn);
+      const mounts = [paletteEl, mobilePaletteEl].filter(Boolean);
+      for (const mount of mounts){
+        mount.innerHTML = "";
+        for (const b of BUILDINGS){
+          const btn = document.createElement("button");
+          btn.className = "palette-card";
+          btn.type = "button";
+          btn.draggable = true;
+          btn.title = `${b.title} (${b.hotkey})`;
+	          btn.style.setProperty("--palette-bg", `url('${b.preview}')`);
+	          btn.innerHTML = `
+	            <span class="palette-tooltip" role="tooltip">
+	              <span class="tooltip-title">${esc(b.title)}</span>
+	              <span class="tooltip-copy">${esc(b.copy || "")}</span>
+	              <span class="tooltip-copy" style="margin-top:6px;">${esc(b.w)}x${esc(b.h)} | ${esc(String(b.hotkey || "").toUpperCase())}</span>
+	            </span>
+	            <span class="hotkey">${esc(b.hotkey)}</span>
+	          `;
+          btn.addEventListener("click", () => {
+            draftKind = b.kind;
+            selected = null;
+            updatePaletteActive();
+            renderBottomPanel();
+            requestDraw();
+          });
+          btn.addEventListener("dragstart", (e) => {
+            draftKind = b.kind;
+            updatePaletteActive();
+            if (e.dataTransfer){
+              e.dataTransfer.setData("text/plain", b.kind);
+              e.dataTransfer.effectAllowed = "copy";
+            }
+          });
+          mount.appendChild(btn);
+        }
       }
       updatePaletteActive();
     }
 
     function updatePaletteActive(){
-      paletteEl.querySelectorAll(".palette-card").forEach((el, idx) => {
-        const b = BUILDINGS[idx];
-        if (!b) return;
-        el.classList.toggle("active", draftKind && b.kind === draftKind);
+      [paletteEl, mobilePaletteEl].filter(Boolean).forEach((root) => {
+        root.querySelectorAll(".palette-card").forEach((el, idx) => {
+          const b = BUILDINGS[idx];
+          if (!b) return;
+          el.classList.toggle("active", draftKind && b.kind === draftKind);
+        });
       });
     }
 
@@ -3218,6 +3762,103 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     if (hudQuestEl && questbookEl){
       hudQuestEl.addEventListener("click", () => {
         questbookEl.classList.toggle("is-hidden");
+      });
+    }
+
+    function applyMobileTab(){
+      const isMobile = window.matchMedia("(max-width: 980px)").matches;
+      if (!isMobile){
+        if (mobileBuildDrawerEl) mobileBuildDrawerEl.style.display = "none";
+        if (mobileRunsEl) mobileRunsEl.style.display = "none";
+        if (questbookEl) questbookEl.classList.add("is-hidden");
+        if (commandbarEl) commandbarEl.style.display = "grid";
+        return;
+      }
+      if (commandbarEl) commandbarEl.style.display = (mobileTab === "base") ? "grid" : "none";
+      if (mobileBuildDrawerEl) mobileBuildDrawerEl.style.display = (mobileTab === "build") ? "block" : "none";
+      if (mobileRunsEl) mobileRunsEl.style.display = (mobileTab === "runs") ? "block" : "none";
+      if (questbookEl) questbookEl.classList.toggle("is-hidden", mobileTab !== "quest");
+      if (mobileTabsEl){
+        mobileTabsEl.querySelectorAll("[data-tab]").forEach((el) => {
+          el.classList.toggle("active", el.getAttribute("data-tab") === mobileTab);
+        });
+      }
+    }
+
+    async function refreshPrFeed(){
+      if (!selected || selected.kind !== "feature" || !prFeedEl) return;
+      const payload = jsonParse(selected.payload_json || "{}");
+      const baseId = String(payload.base_id || "");
+      try{
+        prFeedCards = await fetchJson(`/api/pr-feed?base_id=${encodeURIComponent(baseId)}&limit=30`);
+      }catch(_e){ prFeedCards = []; }
+      renderPrFeed();
+    }
+
+    function renderPrFeed(){
+      if (!prFeedEl) return;
+      if (!Array.isArray(prFeedCards) || !prFeedCards.length){
+        prFeedEl.innerHTML = `<div class="pr-card"><div class="k">No PR runs yet</div></div>`;
+        return;
+      }
+      prFeedEl.innerHTML = prFeedCards.map((c, idx) => {
+        const changed = c.changed_files || {};
+        const sample = Array.isArray(changed.sample) ? changed.sample : [];
+        const files = sample.map((p) => `<div class="pr-file"><div>${esc(p || "")}</div></div>`).join("");
+        return `<article class="pr-card" data-run-id="${esc(c.run_id || "")}" data-pr-index="${idx}">
+          <h4>${esc(c.title || "PR")}</h4>
+          <div class="row"><span>${esc(c.repo || "repo")}</span><span>${esc(c.branch || "branch")}</span></div>
+          <div class="row"><span>${esc(c.status || "")}</span><span>${esc(changed.source || "local")}</span></div>
+          <div class="chip" style="margin-top:6px;">${esc(c.pr_url || "No PR URL")}</div>
+          <div class="k" style="margin-top:6px;">${esc(changed.total_files || 0)} files changed</div>
+          <div class="pr-files" data-files-for="${esc(c.run_id || "")}">${files || '<div class="k">No changed files summary.</div>'}</div>
+          <button class="btn pr-load-files" type="button" style="margin-top:8px; width:100%; min-height:38px;">Load file snippets</button>
+          <textarea class="pr-comment" rows="3" placeholder="Comment + re-emit loop"></textarea>
+          <button class="btn pr-comment-send" type="button" style="margin-top:8px; width:100%; min-height:42px;">Comment + Re-emit</button>
+        </article>`;
+      }).join("");
+
+      prFeedEl.querySelectorAll(".pr-load-files").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const card = btn.closest(".pr-card");
+          if (!card) return;
+          const runId = String(card.getAttribute("data-run-id") || "");
+          const box = card.querySelector(`.pr-files[data-files-for="${runId}"]`);
+          if (!runId || !box) return;
+          btn.disabled = true;
+          try{
+            const files = await fetchJson(`/api/pr-feed/${encodeURIComponent(runId)}/files?max_patch_chars=1200`);
+            box.innerHTML = (Array.isArray(files) ? files : []).map((f) => `<div class="pr-file"><div>${esc(f.path || "")}</div><div class="k">+${esc(f.additions||0)} -${esc(f.deletions||0)}</div><pre>${esc((f.snippet || "").slice(0, 900))}</pre></div>`).join("") || '<div class="k">No file snippets available.</div>';
+          }catch(_e){}
+          btn.disabled = false;
+        });
+      });
+
+      prFeedEl.querySelectorAll(".pr-comment-send").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const card = btn.closest(".pr-card");
+          if (!card) return;
+          const runId = String(card.getAttribute("data-run-id") || "");
+          const ta = card.querySelector(".pr-comment");
+          const comment = ta ? String(ta.value || "").trim() : "";
+          if (!runId || !comment) return;
+          btn.disabled = true;
+          try{
+            await fetchJson("/api/prs/comment", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ run_id: runId, comment }) });
+            if (ta) ta.value = "";
+          }catch(_e){}
+          btn.disabled = false;
+        });
+      });
+    }
+
+    if (mobileTabsEl){
+      mobileTabsEl.querySelectorAll("[data-tab]").forEach((el) => {
+        el.addEventListener("click", () => {
+          mobileTab = String(el.getAttribute("data-tab") || "base");
+          if (mobileTab === "runs") refreshPrFeed();
+          applyMobileTab();
+        });
       });
     }
 
@@ -4206,7 +4847,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       createEntity(kind, state.hover.x, state.hover.y).catch(() => {});
     });
 
-    window.addEventListener("resize", () => resize());
+    window.addEventListener("resize", () => { resize(); applyMobileTab(); });
     window.addEventListener("beforeunload", () => { try{ localStorage.setItem(CAMERA_KEY, JSON.stringify(cam)); }catch(_e){} });
 
     function isTypingTarget(el){
@@ -4284,6 +4925,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       if (commandbarEl) commandbarEl.classList.toggle("idle", !hasDetail);
       if (!selected && !selectedBeltId){
         bottomPanel.innerHTML = "";
+        if (prFeedEl) prFeedEl.innerHTML = "";
         return;
       }
 
@@ -4352,6 +4994,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
       const key = String(selected.id || "");
       const prev = featureDraft.get(key) || "";
+      refreshPrFeed();
       body.innerHTML = `
         <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
           <textarea id="featurePrompt" rows="4" style="flex:1; width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">${esc(prev)}</textarea>
@@ -4503,6 +5146,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }
     loadCamera();
     resize();
+    applyMobileTab();
     renderBottomPanel();
     requestDraw();
     wireQuestEditor();

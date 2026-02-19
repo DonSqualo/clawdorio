@@ -359,3 +359,150 @@ async fn webhook_push_queues_auto_rebase() {
         .unwrap();
     assert_eq!(c, 1);
 }
+
+#[tokio::test]
+async fn pr_feed_lists_feature_runs_with_fallback_summary() {
+    let engine = temp_engine();
+    let base = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({"repo_path":"/tmp/no-such-repo"}).to_string(),
+        )
+        .unwrap();
+    let feature = engine
+        .create_entity_with_payload(
+            "feature",
+            12,
+            0,
+            3,
+            4,
+            &serde_json::json!({"base_id": base.id}).to_string(),
+        )
+        .unwrap();
+    let conn = engine.open().unwrap();
+    conn.execute(
+        "INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at) VALUES (?1,'feature-dev',?2,'running',?3,?4,?5,?5)",
+        (
+            "r-pr-feed-1",
+            "Implement mobile feed",
+            &feature.id,
+            serde_json::json!({
+                "base_repo_path":"/tmp/no-such-repo",
+                "branch":"clawdorio/r-pr-feed-1",
+                "pr_url":"https://github.com/acme/demo/pull/42"
+            })
+            .to_string(),
+            now_rfc3339(),
+        ),
+    )
+    .unwrap();
+
+    let out = api_pr_feed(
+        axum::extract::State(Arc::new(AppState {
+            engine: engine.clone(),
+        })),
+        axum::extract::Query(PrFeedQuery {
+            base_id: Some(base.id.clone()),
+            limit: Some(10),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.0.len(), 1);
+    assert_eq!(out.0[0].run_id, "r-pr-feed-1");
+    assert_eq!(out.0[0].pr_number, Some(42));
+    assert_eq!(out.0[0].changed_files.total_files, 0);
+    assert_eq!(out.0[0].changed_files.source, "fallback");
+}
+
+#[tokio::test]
+async fn pr_comment_reemit_idempotency_and_rate_limit() {
+    let engine = temp_engine();
+    let base = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({"repo_path":"/tmp/no-such-repo"}).to_string(),
+        )
+        .unwrap();
+    let feature = engine
+        .create_entity_with_payload(
+            "feature",
+            12,
+            0,
+            3,
+            4,
+            &serde_json::json!({"base_id": base.id}).to_string(),
+        )
+        .unwrap();
+    let conn = engine.open().unwrap();
+    conn.execute(
+        "INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at) VALUES (?1,'feature-dev','task','running',?2,'{}',?3,?3)",
+        ("r-comment-1", &feature.id, now_rfc3339()),
+    )
+    .unwrap();
+    seed_step(
+        &engine,
+        "s-comment-1",
+        "r-comment-1",
+        "implement",
+        0,
+        "running",
+    );
+
+    let state = axum::extract::State(Arc::new(AppState {
+        engine: engine.clone(),
+    }));
+    let first = api_pr_comment(
+        state.clone(),
+        Json(PrCommentInput {
+            run_id: Some("r-comment-1".to_string()),
+            pr_url: None,
+            pr_number: None,
+            comment: "please rerun".to_string(),
+            idempotency_key: Some("idem-1".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(first.0.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+
+    let replay = api_pr_comment(
+        state.clone(),
+        Json(PrCommentInput {
+            run_id: Some("r-comment-1".to_string()),
+            pr_url: None,
+            pr_number: None,
+            comment: "please rerun".to_string(),
+            idempotency_key: Some("idem-1".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(replay
+        .0
+        .get("idempotent_replay")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false));
+
+    let err = api_pr_comment(
+        state,
+        Json(PrCommentInput {
+            run_id: Some("r-comment-1".to_string()),
+            pr_url: None,
+            pr_number: None,
+            comment: "please rerun again".to_string(),
+            idempotency_key: Some("idem-2".to_string()),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+}

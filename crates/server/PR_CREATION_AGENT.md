@@ -77,3 +77,16 @@ Results are written to `event_log` (`auto_rebase.result`) and step/run status.
 - Base repo must be a valid git repo with `origin` configured.
 - Only branches associated with Clawdorio naming are auto-rebased.
 - Force push is done with `--force-with-lease` only.
+
+
+## Mobile PR feed integration
+
+The server exposes mobile-oriented PR endpoints:
+
+- `GET /api/pr-feed` for PR-linked feature runs
+- `GET /api/pr-feed/{run_id}/files` for per-file snippets
+- `POST /api/prs/comment` to persist comment intent and re-emit linked workers
+
+`POST /api/prs/comment` writes `pr.comment.reemit` to `event_log` and triggers `reemit_workers` with base scope when a linked factory/base exists, preserving existing lifecycle behavior while enabling card-driven feedback loops.
+
+Rate/idempotency guards are applied in this endpoint to avoid tight reemit spam loops.
