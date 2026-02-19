@@ -594,6 +594,23 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE INDEX IF NOT EXISTS idx_belts_updated_at ON belts(updated_at_ms);
 CREATE INDEX IF NOT EXISTS idx_belts_a_id ON belts(a_id);
 CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
+
+CREATE TABLE IF NOT EXISTS library_artifacts (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  base_id TEXT,
+  run_id TEXT,
+  source_event TEXT,
+  hierarchy_json TEXT NOT NULL DEFAULT '{}',
+  document_md TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_agent ON library_artifacts(agent_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_base ON library_artifacts(base_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_run ON library_artifacts(run_id, created_at_ms DESC);
 "#,
         )?;
 
@@ -640,10 +657,76 @@ CREATE TABLE IF NOT EXISTS belts (
 CREATE INDEX IF NOT EXISTS idx_belts_updated_at ON belts(updated_at_ms);
 CREATE INDEX IF NOT EXISTS idx_belts_a_id ON belts(a_id);
 CREATE INDEX IF NOT EXISTS idx_belts_b_id ON belts(b_id);
+
+CREATE TABLE IF NOT EXISTS library_artifacts (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  base_id TEXT,
+  run_id TEXT,
+  source_event TEXT,
+  hierarchy_json TEXT NOT NULL DEFAULT '{}',
+  document_md TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_agent ON library_artifacts(agent_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_base ON library_artifacts(base_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_library_artifacts_run ON library_artifacts(run_id, created_at_ms DESC);
 "#,
     )?;
 
     ensure_column(conn, "belts", "path_json", "TEXT NOT NULL DEFAULT '[]'")?;
+
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS skill_graphs (
+  id TEXT PRIMARY KEY,
+  pack_name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  source_root TEXT NOT NULL,
+  index_path TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS skill_nodes (
+  id TEXT PRIMARY KEY,
+  graph_id TEXT NOT NULL REFERENCES skill_graphs(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  slug TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  body_md TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS skill_edges (
+  graph_id TEXT NOT NULL REFERENCES skill_graphs(id) ON DELETE CASCADE,
+  from_node_id TEXT NOT NULL REFERENCES skill_nodes(id) ON DELETE CASCADE,
+  to_node_id TEXT NOT NULL REFERENCES skill_nodes(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'wikilink',
+  PRIMARY KEY(graph_id, from_node_id, to_node_id, kind)
+);
+CREATE TABLE IF NOT EXISTS skill_assignments (
+  id TEXT PRIMARY KEY,
+  graph_id TEXT NOT NULL REFERENCES skill_graphs(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL REFERENCES skill_nodes(id) ON DELETE CASCADE,
+  scope_kind TEXT NOT NULL,
+  scope_ref TEXT,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_skill_nodes_graph ON skill_nodes(graph_id);
+CREATE INDEX IF NOT EXISTS idx_skill_assignments_scope ON skill_assignments(scope_kind, scope_ref);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_assignments_unique ON skill_assignments(graph_id, node_id, scope_kind, IFNULL(scope_ref,''));
+"#,
+    )?;
 
     // Backfill footprints for early dev DBs that stored everything as 1x1.
     // Only touch rows that still look like defaults.

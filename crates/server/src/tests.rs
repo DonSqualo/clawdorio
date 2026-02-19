@@ -419,6 +419,74 @@ async fn pr_feed_lists_feature_runs_with_fallback_summary() {
     assert_eq!(out.0[0].changed_files.source, "fallback");
 }
 
+#[test]
+fn skill_graph_import_and_preview_precedence() {
+    let engine = temp_engine();
+    let skill_root = std::env::temp_dir().join(format!(
+        "clawdorio-skills-{}",
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    std::fs::create_dir_all(&skill_root).unwrap();
+    std::fs::write(
+        skill_root.join("index.md"),
+        "[[GlobalSkill]]\n[[BaseSkill]]\n[[AgentSkill]]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_root.join("GlobalSkill.md"),
+        "---\ntitle: Global Skill\ndescription: global desc\n---\nshared",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_root.join("BaseSkill.md"),
+        "---\ntitle: Base Skill\ndescription: base desc\n---\n[[GlobalSkill]]",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_root.join("AgentSkill.md"),
+        "---\ntitle: Agent Skill\ndescription: agent desc\n---\n[[BaseSkill]]",
+    )
+    .unwrap();
+
+    let imp = SkillImportInput {
+        pack_name: "pack".to_string(),
+        source_root: skill_root.to_string_lossy().to_string(),
+        index_path: "index.md".to_string(),
+        graph_id: Some("g1".to_string()),
+        title: Some("Pack".to_string()),
+    };
+    import_skill_graph(&engine, &imp).unwrap();
+
+    let base = engine
+        .create_entity_with_payload("base", 0, 0, 9, 9, r#"{"repo_path":"/tmp/repo"}"#)
+        .unwrap();
+    let feature = engine
+        .create_entity_with_payload(
+            "feature",
+            11,
+            0,
+            3,
+            4,
+            &serde_json::json!({"base_id": base.id}).to_string(),
+        )
+        .unwrap();
+
+    let conn = engine.open().unwrap();
+    conn.execute("INSERT INTO runs (id, workflow_id, task, status, entity_id, context_json, created_at, updated_at) VALUES ('r-skill','wf','Agent task', 'queued', ?1, '{}', ?2, ?2)", (&feature.id, now_rfc3339())).unwrap();
+    conn.execute("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status, input_json, output_text, created_at, updated_at) VALUES ('s-skill','r-skill','implement','feature-dev/developer',0,'queued','{}',NULL,?1,?1)", [now_rfc3339()]).unwrap();
+
+    conn.execute("INSERT INTO skill_assignments (id, graph_id, node_id, scope_kind, scope_ref, created_at_ms, updated_at_ms, rev) VALUES ('a1','g1','g1::globalskill','global',NULL,1,1,1)", []).unwrap();
+    conn.execute("INSERT INTO skill_assignments (id, graph_id, node_id, scope_kind, scope_ref, created_at_ms, updated_at_ms, rev) VALUES ('a2','g1','g1::baseskill','base',?1,1,1,1)", [&base.id]).unwrap();
+    conn.execute("INSERT INTO skill_assignments (id, graph_id, node_id, scope_kind, scope_ref, created_at_ms, updated_at_ms, rev) VALUES ('a3','g1','g1::agentskill','agent','feature-dev/developer',1,1,1)", []).unwrap();
+
+    let preview =
+        resolve_skill_context_preview(&engine, "r-skill", "implement", "agent", 3, 8).unwrap();
+    let ids: Vec<String> = preview.items.iter().map(|x| x.node_id.clone()).collect();
+    assert!(ids.iter().any(|x| x == "g1::globalskill"));
+    assert!(ids.iter().any(|x| x == "g1::baseskill"));
+    assert!(ids.iter().any(|x| x == "g1::agentskill"));
+}
+
 #[tokio::test]
 async fn pr_comment_reemit_idempotency_and_rate_limit() {
     let engine = temp_engine();
@@ -505,4 +573,89 @@ async fn pr_comment_reemit_idempotency_and_rate_limit() {
     .await
     .unwrap_err();
     assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn canonical_json_is_stable_and_sorted() {
+    let a: serde_json::Value = serde_json::json!({"b":1,"a":{"d":2,"c":1}});
+    let b: serde_json::Value = serde_json::json!({"a":{"c":1,"d":2},"b":1});
+    assert_eq!(canonical_json_string(&a), canonical_json_string(&b));
+}
+
+#[test]
+fn markdown_renderer_is_deterministic() {
+    let doc = DocNode {
+        title: "Root".to_string(),
+        items: vec!["z:2".to_string(), "a:1".to_string()],
+        children: vec![
+            DocNode {
+                title: "B".to_string(),
+                items: vec!["x".to_string()],
+                children: vec![],
+            },
+            DocNode {
+                title: "A".to_string(),
+                items: vec!["y".to_string()],
+                children: vec![],
+            },
+        ],
+    };
+    let one = render_doc_markdown(&doc);
+    let two = render_doc_markdown(&doc);
+    assert_eq!(one, two);
+    assert!(one.find("## A").unwrap_or(usize::MAX) < one.find("## B").unwrap_or(0));
+}
+
+#[tokio::test]
+async fn library_artifact_rebuild_and_latest() {
+    let engine = temp_engine();
+    let base = engine
+        .create_entity_with_payload(
+            "base",
+            0,
+            0,
+            9,
+            9,
+            &serde_json::json!({"repo_path":"/tmp/repo"}).to_string(),
+        )
+        .unwrap();
+    let lib = engine
+        .create_entity_with_payload(
+            "library",
+            12,
+            0,
+            3,
+            4,
+            &serde_json::json!({"base_id":base.id}).to_string(),
+        )
+        .unwrap();
+    let state = axum::extract::State(Arc::new(AppState {
+        engine: engine.clone(),
+    }));
+
+    let rebuilt = api_library_rebuild(
+        state.clone(),
+        Json(LibraryRebuildInput {
+            agent_id: lib.id.clone(),
+            base_id: Some(base.id.clone()),
+            run_id: None,
+            source_event: Some("test.rebuild".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!rebuilt.0.document_md.is_empty());
+
+    let latest = api_library_latest(
+        state,
+        axum::extract::Query(LibraryArtifactQuery {
+            agent_id: Some(lib.id.clone()),
+            base_id: Some(base.id.clone()),
+            run_id: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(latest.0.id, rebuilt.0.id);
 }

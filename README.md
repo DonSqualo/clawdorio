@@ -58,6 +58,46 @@ npm run tauri dev
   - Safety controls: idempotency key replay suppression + short per-base rate guard to prevent spam reemit loops.
   - Returns actionable `404 no_linked_factory_or_run` when no run/factory can be resolved.
 
+## Deterministic Library artifact API
+
+- `POST /api/library/artifacts/rebuild`
+  - Trigger deterministic markdown rebuild for an agent/base/run.
+- `GET /api/library/artifacts/latest?agent_id=<agent-id>&base_id=<base-id?>&run_id=<run-id?>`
+  - Fetch latest artifact document + metadata.
+- `GET /api/library/artifacts?agent_id=<agent-id?>&base_id=<base-id?>&run_id=<run-id?>&limit=30`
+  - List artifact versions.
+
+See `crates/server/LIBRARY_ARTIFACTS.md` for hierarchy schema and skill append semantics.
+
+## Skill Graph / University APIs
+
+Scope model: `global -> base -> agent` (agent = specialization). University now assigns skill graph nodes to these scopes; Library remains the inspectable artifact sink in-world.
+
+### Endpoints
+
+- `POST /api/skills/import`
+  - Body: `{ pack_name, source_root, index_path, graph_id?, title? }`
+  - Imports markdown skill graph from index wikilinks + linked node files.
+- `GET /api/skills/graphs`
+- `GET /api/skills/nodes?graph_id=<id>`
+- `GET /api/skills/assignments?scope_kind=global|base|agent&scope_ref=<optional>`
+- `POST /api/skills/assign`
+  - Body: `{ graph_id, node_id, scope_kind, scope_ref? }`
+- `POST /api/skills/unassign`
+- `GET /api/skills/preview?run_id=<id>&step_id=<id>&query=<optional>&max_depth=2&max_nodes=8`
+  - Resolves by precedence `global -> base -> agent`, then bounded traversal with relevance scoring.
+- `POST /api/skills/cli`
+  - Body: `{ action: "install"|"update", package }`
+  - Adapter for `skills` CLI, fallback `clawhub skills`; logs command output into `event_log`.
+
+### Graph format
+
+- Index markdown references nodes via wikilinks: `[[NodeName]]`
+- Node markdown files (`NodeName.md`) support YAML frontmatter:
+  - `title`
+  - `description`
+- Wikilinks inside node bodies build graph edges.
+
 ## Internal pipeline docs
 
 - PR creation + auto-rebase path: `crates/server/PR_CREATION_AGENT.md`

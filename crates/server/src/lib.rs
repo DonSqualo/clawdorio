@@ -10,7 +10,11 @@ use axum::{
     Json, Router,
 };
 use clawdorio_engine::{Belt, Engine, Entity, Quest};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,7 +73,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/pr-feed", get(api_pr_feed))
         .route("/api/pr-feed/{run_id}/files", get(api_pr_feed_files))
         .route("/api/prs/comment", post(api_pr_comment))
+        .route("/api/library/artifacts/rebuild", post(api_library_rebuild))
+        .route("/api/library/artifacts/latest", get(api_library_latest))
+        .route("/api/library/artifacts", get(api_library_list))
         .route("/api/feature/build", post(api_feature_build))
+        .route("/api/skills/import", post(api_skills_import))
+        .route("/api/skills/graphs", get(api_skills_graphs_list))
+        .route("/api/skills/nodes", get(api_skills_nodes_list))
+        .route("/api/skills/assignments", get(api_skills_assignments_list))
+        .route("/api/skills/assign", post(api_skills_assign))
+        .route("/api/skills/unassign", post(api_skills_unassign))
+        .route("/api/skills/preview", get(api_skills_preview))
+        .route("/api/skills/cli", post(api_skills_cli))
         .route("/api/workers/reemit", post(api_workers_reemit_global))
         .route("/api/github/webhook", post(api_github_webhook))
         .route(
@@ -1035,6 +1050,524 @@ async fn api_pr_comment(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+struct LibraryRebuildInput {
+    agent_id: String,
+    #[serde(default)]
+    base_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    source_event: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LibraryArtifactQuery {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    base_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct LibraryArtifactView {
+    id: String,
+    agent_id: String,
+    base_id: Option<String>,
+    run_id: Option<String>,
+    source_event: Option<String>,
+    content_hash: String,
+    version: i64,
+    created_at_ms: i64,
+    hierarchy_json: String,
+    document_md: String,
+}
+
+async fn api_library_rebuild(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<LibraryRebuildInput>,
+) -> Result<Json<LibraryArtifactView>, (axum::http::StatusCode, String)> {
+    let artifact = build_and_store_library_artifact(
+        &state.engine,
+        &input.agent_id,
+        input.base_id.as_deref(),
+        input.run_id.as_deref(),
+        input.source_event.as_deref().unwrap_or("manual.rebuild"),
+    )
+    .map_err(internal_error("build_and_store_library_artifact"))?;
+    Ok(Json(artifact))
+}
+
+async fn api_library_latest(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<LibraryArtifactQuery>,
+) -> Result<Json<LibraryArtifactView>, (axum::http::StatusCode, String)> {
+    let Some(agent_id) = q
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "agent_id is required".to_string(),
+        ));
+    };
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, agent_id, base_id, run_id, source_event, content_hash, version, created_at_ms, hierarchy_json, document_md
+             FROM library_artifacts
+             WHERE agent_id = ?1
+               AND (?2 IS NULL OR base_id = ?2)
+               AND (?3 IS NULL OR run_id = ?3)
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT 1",
+        )
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare_library_latest: {e}")))?;
+    let row = stmt
+        .query_row((agent_id, q.base_id.as_deref(), q.run_id.as_deref()), |r| {
+            Ok(LibraryArtifactView {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                base_id: r.get(2)?,
+                run_id: r.get(3)?,
+                source_event: r.get(4)?,
+                content_hash: r.get(5)?,
+                version: r.get(6)?,
+                created_at_ms: r.get(7)?,
+                hierarchy_json: r.get(8)?,
+                document_md: r.get(9)?,
+            })
+        })
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "library_artifact_not_found".to_string(),
+            )
+        })?;
+    Ok(Json(row))
+}
+
+async fn api_library_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<LibraryArtifactQuery>,
+) -> Result<Json<Vec<LibraryArtifactView>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let limit = q.limit.unwrap_or(30).clamp(1, 200) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, agent_id, base_id, run_id, source_event, content_hash, version, created_at_ms, hierarchy_json, document_md
+             FROM library_artifacts
+             WHERE (?1 IS NULL OR agent_id = ?1)
+               AND (?2 IS NULL OR base_id = ?2)
+               AND (?3 IS NULL OR run_id = ?3)
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?4",
+        )
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare_library_list: {e}")))?;
+    let rows = stmt
+        .query_map(
+            (
+                q.agent_id.as_deref(),
+                q.base_id.as_deref(),
+                q.run_id.as_deref(),
+                limit,
+            ),
+            |r| {
+                Ok(LibraryArtifactView {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    base_id: r.get(2)?,
+                    run_id: r.get(3)?,
+                    source_event: r.get(4)?,
+                    content_hash: r.get(5)?,
+                    version: r.get(6)?,
+                    created_at_ms: r.get(7)?,
+                    hierarchy_json: r.get(8)?,
+                    document_md: r.get(9)?,
+                })
+            },
+        )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query_library_list: {e}"),
+            )
+        })?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DocNode {
+    title: String,
+    #[serde(default)]
+    items: Vec<String>,
+    #[serde(default)]
+    children: Vec<DocNode>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillContextBlock {
+    scope: String,
+    source: String,
+    node_ref: String,
+    title: String,
+    body: String,
+}
+
+fn build_and_store_library_artifact(
+    engine: &Engine,
+    agent_id: &str,
+    base_id: Option<&str>,
+    run_id: Option<&str>,
+    source_event: &str,
+) -> anyhow::Result<LibraryArtifactView> {
+    let doc = build_library_doc(engine, agent_id, base_id, run_id)?;
+    let hierarchy_json = canonical_json_string(&serde_json::to_value(&doc)?);
+    let document_md = render_doc_markdown(&doc);
+    let mut hasher = Sha256::new();
+    hasher.update(document_md.as_bytes());
+    let content_hash = format!("{:x}", hasher.finalize());
+
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    let version: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM library_artifacts WHERE agent_id=?1 AND (?2 IS NULL OR base_id=?2) AND (?3 IS NULL OR run_id=?3)",
+            (agent_id, base_id, run_id),
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    let id = format!("libdoc-{}", now_ms_i64());
+    let created_at_ms = now_ms_i64();
+    tx.execute(
+        "INSERT INTO library_artifacts (id, agent_id, base_id, run_id, source_event, hierarchy_json, document_md, content_hash, version, created_at_ms, rev)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+        (
+            &id,
+            agent_id,
+            base_id,
+            run_id,
+            source_event,
+            &hierarchy_json,
+            &document_md,
+            &content_hash,
+            version,
+            created_at_ms,
+        ),
+    )?;
+    tx.execute(
+        "INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'library.artifact.generated', ?2, ?3)",
+        (
+            created_at_ms,
+            run_id.or(base_id).or(Some(agent_id)),
+            serde_json::json!({
+                "agent_id": agent_id,
+                "base_id": base_id,
+                "run_id": run_id,
+                "version": version,
+                "content_hash": content_hash,
+                "source_event": source_event,
+            })
+            .to_string(),
+        ),
+    )?;
+    tx.commit()?;
+
+    Ok(LibraryArtifactView {
+        id,
+        agent_id: agent_id.to_string(),
+        base_id: base_id.map(|s| s.to_string()),
+        run_id: run_id.map(|s| s.to_string()),
+        source_event: Some(source_event.to_string()),
+        content_hash,
+        version,
+        created_at_ms,
+        hierarchy_json,
+        document_md,
+    })
+}
+
+fn build_library_doc(
+    engine: &Engine,
+    agent_id: &str,
+    base_id: Option<&str>,
+    run_id: Option<&str>,
+) -> anyhow::Result<DocNode> {
+    let conn = engine.open()?;
+    let mut root = DocNode {
+        title: format!("Library Artifact: {}", agent_id),
+        items: vec![],
+        children: vec![],
+    };
+
+    root.items.push(format!("agent_id: {}", agent_id));
+    root.items
+        .push(format!("base_id: {}", base_id.unwrap_or("-")));
+    root.items
+        .push(format!("run_id: {}", run_id.unwrap_or("-")));
+
+    let mut runs_section = DocNode {
+        title: "Runs".to_string(),
+        items: vec![],
+        children: vec![],
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, task, status, entity_id, created_at, updated_at, context_json
+         FROM runs
+         WHERE (?1 IS NULL OR id=?1)
+           AND (?2 IS NULL OR entity_id IN (SELECT id FROM entities WHERE json_extract(payload_json, '$.base_id')=?2 OR id=?2))
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let run_rows = stmt.query_map((run_id, base_id), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+
+    for row in run_rows.filter_map(Result::ok) {
+        let (rid, task, status, entity_id, created_at, updated_at, context_json) = row;
+        let mut rn = DocNode {
+            title: format!("Run {}", rid),
+            items: vec![],
+            children: vec![],
+        };
+        rn.items.push(format!("status: {}", status));
+        rn.items.push(format!(
+            "entity_id: {}",
+            entity_id.unwrap_or_else(|| "-".to_string())
+        ));
+        rn.items.push(format!("created_at: {}", created_at));
+        rn.items.push(format!("updated_at: {}", updated_at));
+        rn.items.push(format!("task: {}", task.replace('\n', " ")));
+
+        let ctx_val: serde_json::Value =
+            serde_json::from_str(&context_json).unwrap_or_else(|_| serde_json::json!({}));
+        rn.children.push(DocNode {
+            title: "Context".to_string(),
+            items: vec![canonical_json_string(&ctx_val)],
+            children: vec![],
+        });
+
+        let mut step_stmt = conn.prepare(
+            "SELECT step_index, step_id, agent_id, status, COALESCE(output_text,''), input_json
+             FROM steps WHERE run_id=?1 ORDER BY step_index ASC, step_id ASC",
+        )?;
+        let mut steps_node = DocNode {
+            title: "Steps".to_string(),
+            items: vec![],
+            children: vec![],
+        };
+        let step_rows = step_stmt.query_map([rid.as_str()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut skill_blocks: Vec<SkillContextBlock> = vec![];
+        for sr in step_rows.filter_map(Result::ok) {
+            let (idx, step_id, step_agent, step_status, output_text, input_json) = sr;
+            let mut sn = DocNode {
+                title: format!("{:02}. {}", idx, step_id),
+                items: vec![],
+                children: vec![],
+            };
+            sn.items.push(format!("agent: {}", step_agent));
+            sn.items.push(format!("status: {}", step_status));
+            let out_norm = output_text.trim().replace('\n', "\\n");
+            if !out_norm.is_empty() {
+                sn.items.push(format!("output: {}", out_norm));
+            }
+            let input_val: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
+            collect_skill_contexts(&mut skill_blocks, &input_val, &format!("step:{}", step_id));
+            steps_node.children.push(sn);
+        }
+
+        collect_skill_contexts(&mut skill_blocks, &ctx_val, "run_context");
+        skill_blocks.sort_by(|a, b| {
+            (
+                a.scope.as_str(),
+                a.source.as_str(),
+                a.node_ref.as_str(),
+                a.title.as_str(),
+                a.body.as_str(),
+            )
+                .cmp(&(
+                    b.scope.as_str(),
+                    b.source.as_str(),
+                    b.node_ref.as_str(),
+                    b.title.as_str(),
+                    b.body.as_str(),
+                ))
+        });
+        let mut skills_node = DocNode {
+            title: "Skill Context (University -> Library)".to_string(),
+            items: vec![],
+            children: vec![],
+        };
+        for b in skill_blocks {
+            skills_node.children.push(DocNode {
+                title: if b.title.trim().is_empty() {
+                    "Skill".to_string()
+                } else {
+                    b.title
+                },
+                items: vec![
+                    format!("scope: {}", b.scope),
+                    format!("source: {}", b.source),
+                    format!("node_ref: {}", b.node_ref),
+                    format!("body: {}", b.body.replace('\n', "\\n")),
+                ],
+                children: vec![],
+            });
+        }
+
+        rn.children.push(steps_node);
+        rn.children.push(skills_node);
+        runs_section.children.push(rn);
+    }
+
+    runs_section.children.sort_by(|a, b| a.title.cmp(&b.title));
+    root.children.push(runs_section);
+    Ok(root)
+}
+
+fn collect_skill_contexts(
+    out: &mut Vec<SkillContextBlock>,
+    value: &serde_json::Value,
+    fallback_source: &str,
+) {
+    if let Some(arr) = value.get("skill_contexts").and_then(|v| v.as_array()) {
+        for v in arr {
+            let obj = v.as_object().cloned().unwrap_or_default();
+            out.push(SkillContextBlock {
+                scope: obj
+                    .get("scope")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                source: obj
+                    .get("source")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(fallback_source)
+                    .to_string(),
+                node_ref: obj
+                    .get("node_ref")
+                    .or_else(|| obj.get("node"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                title: obj
+                    .get("title")
+                    .or_else(|| obj.get("skill"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("skill-context")
+                    .to_string(),
+                body: obj
+                    .get("body")
+                    .or_else(|| obj.get("content"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(arr) = value
+        .get("assignment")
+        .and_then(|v| v.get("skills"))
+        .and_then(|v| v.as_array())
+    {
+        for v in arr {
+            let name = v
+                .get("name")
+                .or_else(|| v.get("id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("skill");
+            out.push(SkillContextBlock {
+                scope: v
+                    .get("scope")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("assignment")
+                    .to_string(),
+                source: fallback_source.to_string(),
+                node_ref: v
+                    .get("node_ref")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("-")
+                    .to_string(),
+                title: name.to_string(),
+                body: canonical_json_string(v),
+            });
+        }
+    }
+}
+
+fn canonical_json_string(v: &serde_json::Value) -> String {
+    fn norm(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut sorted = BTreeMap::new();
+                for (k, vv) in map {
+                    sorted.insert(k.clone(), norm(vv));
+                }
+                let mut out = serde_json::Map::new();
+                for (k, vv) in sorted {
+                    out.insert(k, vv);
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(norm).collect())
+            }
+            _ => v.clone(),
+        }
+    }
+    serde_json::to_string_pretty(&norm(v)).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn render_doc_markdown(root: &DocNode) -> String {
+    fn walk(buf: &mut String, node: &DocNode, depth: usize) {
+        let hashes = "#".repeat(depth.max(1));
+        buf.push_str(&format!("{} {}\n\n", hashes, node.title));
+        let mut items = node.items.clone();
+        items.sort();
+        for item in items {
+            buf.push_str("- ");
+            buf.push_str(item.trim());
+            buf.push('\n');
+        }
+        if !node.items.is_empty() {
+            buf.push('\n');
+        }
+        let mut children = node.children.clone();
+        children.sort_by(|a, b| a.title.cmp(&b.title));
+        for ch in children {
+            walk(buf, &ch, depth + 1);
+        }
+    }
+    let mut out = String::new();
+    walk(&mut out, root, 1);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
 fn parse_pr_number_from_url(url: &str) -> Option<i64> {
     let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
     if parts.len() < 2 || parts[parts.len() - 2] != "pull" {
@@ -1350,11 +1883,536 @@ async fn api_feature_build(
         ));
     }
 
+    let _ = build_and_store_library_artifact(
+        &state.engine,
+        &input.entity_id,
+        Some(base.id.as_str()),
+        Some(run_id.as_str()),
+        "run.queued",
+    );
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "run_id": run_id,
         "worktree_path": wt_dir_s,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillImportInput {
+    pack_name: String,
+    source_root: String,
+    index_path: String,
+    #[serde(default)]
+    graph_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillGraphRow {
+    id: String,
+    pack_name: String,
+    title: String,
+    source_root: String,
+    index_path: String,
+    metadata_json: String,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SkillNodeRow {
+    id: String,
+    graph_id: String,
+    title: String,
+    slug: String,
+    file_path: String,
+    description: String,
+    body_md: String,
+    metadata_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsNodesQuery {
+    graph_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsAssignmentsQuery {
+    scope_kind: String,
+    #[serde(default)]
+    scope_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillAssignInput {
+    graph_id: String,
+    node_id: String,
+    scope_kind: String,
+    #[serde(default)]
+    scope_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsPreviewQuery {
+    run_id: String,
+    step_id: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillPreviewItem {
+    node_id: String,
+    title: String,
+    description: String,
+    depth: usize,
+    score: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsCliInput {
+    action: String,
+    package: String,
+}
+
+async fn api_skills_import(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<SkillImportInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let graph =
+        import_skill_graph(&state.engine, &input).map_err(internal_error("import_skill_graph"))?;
+    Ok(Json(
+        serde_json::json!({"ok": true, "graph_id": graph.id, "nodes": graph.node_count, "edges": graph.edge_count}),
+    ))
+}
+
+async fn api_skills_graphs_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<Vec<SkillGraphRow>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn.prepare("SELECT id, pack_name, title, source_root, index_path, metadata_json, updated_at_ms FROM skill_graphs ORDER BY updated_at_ms DESC").map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare.skill_graphs: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(SkillGraphRow {
+                id: r.get(0)?,
+                pack_name: r.get(1)?,
+                title: r.get(2)?,
+                source_root: r.get(3)?,
+                index_path: r.get(4)?,
+                metadata_json: r.get(5)?,
+                updated_at_ms: r.get(6)?,
+            })
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query.skill_graphs: {e}"),
+            )
+        })?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+async fn api_skills_nodes_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<SkillsNodesQuery>,
+) -> Result<Json<Vec<SkillNodeRow>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn.prepare("SELECT id, graph_id, title, slug, file_path, description, body_md, metadata_json FROM skill_nodes WHERE graph_id=?1 ORDER BY title ASC").map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare.skill_nodes: {e}")))?;
+    let rows = stmt
+        .query_map([q.graph_id], |r| {
+            Ok(SkillNodeRow {
+                id: r.get(0)?,
+                graph_id: r.get(1)?,
+                title: r.get(2)?,
+                slug: r.get(3)?,
+                file_path: r.get(4)?,
+                description: r.get(5)?,
+                body_md: r.get(6)?,
+                metadata_json: r.get(7)?,
+            })
+        })
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db.query.skill_nodes: {e}"),
+            )
+        })?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+async fn api_skills_assignments_list(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<SkillsAssignmentsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let mut stmt = conn.prepare("SELECT a.id, a.graph_id, a.node_id, a.scope_kind, IFNULL(a.scope_ref,''), n.title FROM skill_assignments a JOIN skill_nodes n ON n.id=a.node_id WHERE a.scope_kind=?1 AND IFNULL(a.scope_ref,'')=IFNULL(?2,'') ORDER BY n.title ASC").map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.prepare.skill_assignments: {e}")))?;
+    let rows = stmt.query_map((q.scope_kind, q.scope_ref.unwrap_or_default()), |r| {
+        Ok(serde_json::json!({"id": r.get::<_, String>(0)?, "graph_id": r.get::<_, String>(1)?, "node_id": r.get::<_, String>(2)?, "scope_kind": r.get::<_, String>(3)?, "scope_ref": r.get::<_, String>(4)?, "title": r.get::<_, String>(5)? }))
+    }).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.query.skill_assignments: {e}")))?;
+    Ok(Json(rows.filter_map(Result::ok).collect()))
+}
+
+async fn api_skills_assign(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<SkillAssignInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let mut conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let tx = conn.transaction().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.transaction: {e}"),
+        )
+    })?;
+    let id = format!("assign-{}", now_ms_i64());
+    tx.execute("INSERT OR IGNORE INTO skill_assignments (id, graph_id, node_id, scope_kind, scope_ref, created_at_ms, updated_at_ms, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)",
+        (&id, &input.graph_id, &input.node_id, &input.scope_kind, &input.scope_ref, now_ms_i64())).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.insert.skill_assignment: {e}")))?;
+    tx.commit().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db.commit: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn api_skills_unassign(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<SkillAssignInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let n = conn.execute("DELETE FROM skill_assignments WHERE graph_id=?1 AND node_id=?2 AND scope_kind=?3 AND IFNULL(scope_ref,'')=IFNULL(?4,'')", (&input.graph_id, &input.node_id, &input.scope_kind, &input.scope_ref)).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("db.delete.skill_assignment: {e}")))?;
+    Ok(Json(serde_json::json!({"ok": true, "deleted": n})))
+}
+
+async fn api_skills_preview(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<SkillsPreviewQuery>,
+) -> Result<Json<Vec<SkillPreviewItem>>, (axum::http::StatusCode, String)> {
+    let out = resolve_skill_context_preview(
+        &state.engine,
+        &q.run_id,
+        &q.step_id,
+        q.query.as_deref().unwrap_or(""),
+        q.max_depth.unwrap_or(2),
+        q.max_nodes.unwrap_or(8),
+    )
+    .map_err(internal_error("resolve_skill_context_preview"))?;
+    Ok(Json(out.items))
+}
+
+async fn api_skills_cli(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(input): Json<SkillsCliInput>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let action = input.action.trim();
+    if !matches!(action, "install" | "update") {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "action must be install|update".to_string(),
+        ));
+    }
+    let mut output = Command::new("skills")
+        .arg(action)
+        .arg(&input.package)
+        .output();
+    if output.is_err() {
+        output = Command::new("clawhub")
+            .arg("skills")
+            .arg(action)
+            .arg(&input.package)
+            .output();
+    }
+    let out = output.map_err(|e| {
+        (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            format!("skills_cli_missing: {e}"),
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let conn = state.engine.open().map_err(internal_error("engine.open"))?;
+    let _ = conn.execute("INSERT INTO event_log (ts_ms, kind, entity_id, payload_json) VALUES (?1, 'skills.cli', NULL, ?2)", (now_ms_i64(), serde_json::json!({"action": action, "package": input.package, "ok": out.status.success(), "stdout": stdout, "stderr": stderr}).to_string()));
+    Ok(Json(
+        serde_json::json!({"ok": out.status.success(), "stdout": stdout, "stderr": stderr}),
+    ))
+}
+
+#[derive(Debug)]
+struct ImportedGraphStats {
+    id: String,
+    node_count: usize,
+    edge_count: usize,
+}
+
+fn import_skill_graph(
+    engine: &Engine,
+    input: &SkillImportInput,
+) -> anyhow::Result<ImportedGraphStats> {
+    let source_root = std::path::PathBuf::from(input.source_root.trim());
+    let index_rel = input.index_path.trim();
+    let index_abs = source_root.join(index_rel);
+    let graph_id = input
+        .graph_id
+        .clone()
+        .unwrap_or_else(|| format!("graph-{}", now_ms_i64()));
+    let index_md = std::fs::read_to_string(&index_abs)?;
+    let links = extract_wikilinks(&index_md);
+
+    let mut nodes: HashMap<String, SkillNodeRow> = HashMap::new();
+    for link in links {
+        let p = source_root.join(format!("{}.md", link));
+        if !p.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&p).unwrap_or_default();
+        let (meta, body) = split_frontmatter(&raw);
+        let desc = meta
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = meta
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&link)
+            .to_string();
+        let node_id = format!("{}::{}", graph_id, slugify(&link));
+        nodes.insert(
+            node_id.clone(),
+            SkillNodeRow {
+                id: node_id,
+                graph_id: graph_id.clone(),
+                title,
+                slug: slugify(&link),
+                file_path: p.to_string_lossy().to_string(),
+                description: desc,
+                body_md: body.to_string(),
+                metadata_json: meta.to_string(),
+            },
+        );
+    }
+
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for node in nodes.values() {
+        for to in extract_wikilinks(&node.body_md) {
+            let to_id = format!("{}::{}", graph_id, slugify(&to));
+            if nodes.contains_key(&to_id) {
+                edges.push((node.id.clone(), to_id));
+            }
+        }
+    }
+
+    let mut conn = engine.open()?;
+    let tx = conn.transaction()?;
+    let ts = now_ms_i64();
+    tx.execute("INSERT OR REPLACE INTO skill_graphs (id, pack_name, title, source_root, index_path, metadata_json, created_at_ms, updated_at_ms, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE((SELECT created_at_ms FROM skill_graphs WHERE id=?1), ?7), ?7, COALESCE((SELECT rev FROM skill_graphs WHERE id=?1),0)+1)",
+        (&graph_id, &input.pack_name, &input.title.clone().unwrap_or_else(|| input.pack_name.clone()), &input.source_root, &input.index_path, &serde_json::json!({"imported_at_ms": ts}).to_string(), ts))?;
+    tx.execute("DELETE FROM skill_nodes WHERE graph_id=?1", [&graph_id])?;
+    tx.execute("DELETE FROM skill_edges WHERE graph_id=?1", [&graph_id])?;
+    for n in nodes.values() {
+        tx.execute("INSERT INTO skill_nodes (id, graph_id, title, slug, file_path, description, body_md, metadata_json, created_at_ms, updated_at_ms, rev) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 1)", (&n.id, &n.graph_id, &n.title, &n.slug, &n.file_path, &n.description, &n.body_md, &n.metadata_json, ts))?;
+    }
+    for (from, to) in &edges {
+        tx.execute("INSERT OR IGNORE INTO skill_edges (graph_id, from_node_id, to_node_id, kind) VALUES (?1, ?2, ?3, 'wikilink')", (&graph_id, from, to))?;
+    }
+    tx.commit()?;
+    Ok(ImportedGraphStats {
+        id: graph_id,
+        node_count: nodes.len(),
+        edge_count: edges.len(),
+    })
+}
+
+fn extract_wikilinks(md: &str) -> Vec<String> {
+    let re = Regex::new(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]").expect("wikilink regex");
+    let mut out = Vec::new();
+    for c in re.captures_iter(md) {
+        if let Some(m) = c.get(1) {
+            let s = m.as_str().trim().replace(' ', "-");
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+fn split_frontmatter(raw: &str) -> (serde_json::Value, &str) {
+    if let Some(stripped) = raw.strip_prefix("---\n") {
+        if let Some(idx) = stripped.find("\n---\n") {
+            let yml = &stripped[..idx];
+            let body = &stripped[idx + 5..];
+            let v: serde_yaml::Value = serde_yaml::from_str(yml).unwrap_or(serde_yaml::Value::Null);
+            let j = serde_json::to_value(v).unwrap_or_else(|_| serde_json::json!({}));
+            return (j, body);
+        }
+    }
+    (serde_json::json!({}), raw)
+}
+
+fn slugify(s: &str) -> String {
+    s.trim().to_lowercase().replace(' ', "-")
+}
+
+struct SkillPreviewResolved {
+    items: Vec<SkillPreviewItem>,
+    prompt: String,
+}
+
+fn resolve_skill_context_preview(
+    engine: &Engine,
+    run_id: &str,
+    step_id: &str,
+    query: &str,
+    max_depth: usize,
+    max_nodes: usize,
+) -> anyhow::Result<SkillPreviewResolved> {
+    let conn = engine.open()?;
+    let (entity_id, task, context_json): (Option<String>, String, String) = conn.query_row(
+        "SELECT entity_id, task, context_json FROM runs WHERE id=?1",
+        [run_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let mut scope_chain: Vec<(String, Option<String>)> = vec![("global".to_string(), None)];
+    let base_id = entity_id
+        .as_deref()
+        .and_then(|eid| resolve_base_for_entity(&conn, eid));
+    if let Some(b) = base_id.clone() {
+        scope_chain.push(("base".to_string(), Some(b)));
+    }
+    let agent_id = {
+        let mut stmt =
+            conn.prepare("SELECT agent_id FROM steps WHERE run_id=?1 AND step_id=?2 LIMIT 1")?;
+        stmt.query_row((run_id, step_id), |r| r.get::<_, String>(0))
+            .ok()
+    };
+    if let Some(a) = agent_id.clone() {
+        scope_chain.push(("agent".to_string(), Some(a)));
+    }
+
+    let mut seed_ids: Vec<String> = Vec::new();
+    for (kind, scope_ref) in &scope_chain {
+        let mut stmt = conn.prepare("SELECT node_id FROM skill_assignments WHERE scope_kind=?1 AND IFNULL(scope_ref,'')=IFNULL(?2,'') ORDER BY updated_at_ms ASC")?;
+        let rows = stmt.query_map((kind, scope_ref.clone().unwrap_or_default()), |r| {
+            r.get::<_, String>(0)
+        })?;
+        for id in rows.filter_map(Result::ok) {
+            seed_ids.push(id);
+        }
+    }
+
+    let mut node_map: HashMap<String, SkillNodeRow> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT id, graph_id, title, slug, file_path, description, body_md, metadata_json FROM skill_nodes")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(SkillNodeRow {
+            id: r.get(0)?,
+            graph_id: r.get(1)?,
+            title: r.get(2)?,
+            slug: r.get(3)?,
+            file_path: r.get(4)?,
+            description: r.get(5)?,
+            body_md: r.get(6)?,
+            metadata_json: r.get(7)?,
+        })
+    })?;
+    for row in rows.filter_map(Result::ok) {
+        node_map.insert(row.id.clone(), row);
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut estmt = conn.prepare("SELECT from_node_id, to_node_id FROM skill_edges")?;
+    let ers = estmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for (a, b) in ers.filter_map(Result::ok) {
+        adj.entry(a).or_default().push(b);
+    }
+
+    let terms = tokenize(&(format!("{} {} {}", task, query, context_json)));
+    let mut qd: VecDeque<(String, usize)> = VecDeque::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for s in seed_ids {
+        qd.push_back((s, 0));
+    }
+    let mut items = Vec::new();
+    while let Some((id, d)) = qd.pop_front() {
+        if d > max_depth || seen.contains(&id) {
+            continue;
+        }
+        seen.insert(id.clone());
+        let Some(n) = node_map.get(&id) else {
+            continue;
+        };
+        let score = relevance_score(n, &terms, d);
+        items.push(SkillPreviewItem {
+            node_id: id.clone(),
+            title: n.title.clone(),
+            description: n.description.clone(),
+            depth: d,
+            score,
+        });
+        if let Some(nexts) = adj.get(&id) {
+            for to in nexts {
+                qd.push_back((to.clone(), d + 1));
+            }
+        }
+        if items.len() >= max_nodes.saturating_mul(3) {
+            break;
+        }
+    }
+    items.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    items.truncate(max_nodes);
+    let mut prompt = String::from("SKILL_CONTEXT\n");
+    for it in &items {
+        prompt.push_str(&format!(
+            "- [{}] {}: {}\n",
+            it.node_id, it.title, it.description
+        ));
+    }
+    if prompt.len() > 6000 {
+        prompt.truncate(6000);
+    }
+    Ok(SkillPreviewResolved { items, prompt })
+}
+
+fn resolve_base_for_entity(conn: &rusqlite::Connection, entity_id: &str) -> Option<String> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind, payload_json FROM entities WHERE id=?1",
+            [entity_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+    let (kind, payload_raw) = row?;
+    if kind == "base" {
+        return Some(entity_id.to_string());
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload_raw).unwrap_or_else(|_| serde_json::json!({}));
+    payload
+        .get("base_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn tokenize(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_lowercase())
+        .collect()
+}
+
+fn relevance_score(node: &SkillNodeRow, terms: &[String], depth: usize) -> i64 {
+    let hay = format!("{} {} {}", node.title, node.description, node.body_md).to_lowercase();
+    let hits = terms.iter().filter(|t| hay.contains(&***t)).count() as i64;
+    hits * 10 - depth as i64
 }
 
 async fn api_workers_reemit_global(
@@ -2555,6 +3613,15 @@ fn finalize_step_failed(engine: &Engine, step: &PendingStep, err: &str) -> anyho
         ),
     )?;
     tx.commit()?;
+    if !requeued {
+        let _ = build_and_store_library_artifact(
+            engine,
+            &step.agent_id,
+            None,
+            Some(&step.run_id),
+            "run.failed",
+        );
+    }
     Ok(())
 }
 
@@ -2597,7 +3664,15 @@ fn execute_step_blocking(engine: &Engine, step: &PendingStep) -> anyhow::Result<
         return Ok(url);
     }
 
-    let msg = build_step_message(step, &repo, &branch, &pr_url);
+    let mut msg = build_step_message(step, &repo, &branch, &pr_url);
+    if let Ok(skill_ctx) =
+        resolve_skill_context_preview(engine, &step.run_id, &step.step_id, &step.task, 2, 8)
+    {
+        if !skill_ctx.prompt.trim().is_empty() {
+            msg.push_str("\n\n");
+            msg.push_str(&skill_ctx.prompt);
+        }
+    }
     let out = Command::new("openclaw")
         .arg("agent")
         .arg("--agent")
@@ -4978,6 +6053,94 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             <div style="flex:1; width:100%; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(repo)}</div>
           </div>
         `;
+        return;
+      }
+
+      if (selected.kind === "library"){
+        const baseId = String(payload.base_id || "");
+        body.innerHTML = `
+          <div class="row"><span>base</span><span>${esc(baseId || "-")}</span></div>
+          <div style="margin-top:8px; display:flex; gap:8px;">
+            <button id="libraryRefreshBtn" class="btn" type="button">Rebuild</button>
+          </div>
+          <div id="libraryMeta" class="sub" style="margin-top:8px;"></div>
+          <pre id="libraryDoc" style="white-space:pre-wrap; word-break:break-word; border:1px solid #4f799f55; background:#040b16; padding:10px; font-size:11px; color:#cfefff; max-height:280px; overflow:auto; margin-top:8px;"></pre>
+        `;
+        const metaEl = body.querySelector("#libraryMeta");
+        const docEl = body.querySelector("#libraryDoc");
+        const loadLatest = async () => {
+          try{
+            const q = `/api/library/artifacts/latest?agent_id=${encodeURIComponent(String(selected.id||""))}&base_id=${encodeURIComponent(baseId)}`;
+            const art = await fetchJson(q);
+            if (metaEl) metaEl.textContent = `v${String(art.version||"")} • ${String(art.content_hash||"").slice(0,12)} • ${String(art.source_event||"")}`;
+            if (docEl) docEl.textContent = String(art.document_md || "");
+          }catch(_e){
+            if (metaEl) metaEl.textContent = "no artifact yet";
+            if (docEl) docEl.textContent = "";
+          }
+        };
+        const btn2 = body.querySelector("#libraryRefreshBtn");
+        if (btn2){
+          btn2.addEventListener("click", async () => {
+            btn2.disabled = true;
+            try{
+              await fetchJson("/api/library/artifacts/rebuild", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ agent_id: String(selected.id||""), base_id: baseId || null, source_event: "ui.rebuild" }),
+              });
+              await loadLatest();
+            }catch(_e){}
+            btn2.disabled = false;
+          });
+        }
+        loadLatest();
+        return;
+      }
+
+      if (selected.kind === "university"){
+        const baseId = String(payload.base_id || "");
+        body.innerHTML = `
+          <div class="row"><span>base</span><span>${esc(baseId)}</span></div>
+          <div class="row" style="margin-top:8px;"><span>scope</span><span>global / base / agent</span></div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px;">
+            <input id="skillGraphId" placeholder="graph id" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:8px; border-radius:0;" />
+            <input id="skillNodeId" placeholder="node id" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:8px; border-radius:0;" />
+            <select id="skillScopeKind" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:8px; border-radius:0;"><option>global</option><option>base</option><option>agent</option></select>
+            <input id="skillScopeRef" placeholder="scope ref (base id / agent id)" style="border:1px solid #4f799f; background:#0b1b30; color:#cfefff; padding:8px; border-radius:0;" />
+          </div>
+          <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+            <button id="skillAssignBtn" class="btn" type="button" style="border-radius:0;">Assign</button>
+            <button id="skillListBtn" class="btn" type="button" style="border-radius:0;">List</button>
+          </div>
+          <pre id="skillOut" style="margin-top:8px; white-space:pre-wrap; max-height:180px; overflow:auto; border:1px solid #4f799f55; padding:8px; border-radius:0;"></pre>
+        `;
+        const out = body.querySelector("#skillOut");
+        const assignBtn = body.querySelector("#skillAssignBtn");
+        const listBtn = body.querySelector("#skillListBtn");
+        async function listScope(){
+          const kindEl = body.querySelector("#skillScopeKind");
+          const refEl = body.querySelector("#skillScopeRef");
+          const kind = String(kindEl && "value" in kindEl ? kindEl.value : "global");
+          const ref = String(refEl && "value" in refEl ? refEl.value : "");
+          const qs = new URLSearchParams({ scope_kind: kind, scope_ref: ref });
+          const rows = await fetchJson(`/api/skills/assignments?${qs.toString()}`);
+          if (out) out.textContent = JSON.stringify(rows, null, 2);
+        }
+        if (listBtn) listBtn.addEventListener("click", () => { listScope().catch(() => {}); });
+        if (assignBtn) assignBtn.addEventListener("click", async () => {
+          const graphEl = body.querySelector("#skillGraphId");
+          const nodeEl = body.querySelector("#skillNodeId");
+          const kindEl = body.querySelector("#skillScopeKind");
+          const refEl = body.querySelector("#skillScopeRef");
+          const graph_id = String(graphEl && "value" in graphEl ? graphEl.value : "").trim();
+          const node_id = String(nodeEl && "value" in nodeEl ? nodeEl.value : "").trim();
+          const scope_kind = String(kindEl && "value" in kindEl ? kindEl.value : "global");
+          const scope_ref = String(refEl && "value" in refEl ? refEl.value : "");
+          if (!graph_id || !node_id) return;
+          await fetchJson("/api/skills/assign", { method: "POST", headers: {"content-type":"application/json"}, body: JSON.stringify({ graph_id, node_id, scope_kind, scope_ref }) });
+          await listScope();
+        });
         return;
       }
 
