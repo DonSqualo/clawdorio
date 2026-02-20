@@ -9,6 +9,7 @@ fi
 
 ROOT="${DMUX_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 CLI="$ROOT/clawdorio"
+APPLIED_MARKER="$ROOT/.dmux-hooks/.runtime/hook-applied-last.txt"
 
 if [ ! -x "$CLI" ]; then
   CLI="$ROOT/scripts/clawdorio"
@@ -20,6 +21,14 @@ fi
 
 case "$ACTION" in
   start)
+    mkdir -p "$(dirname "$APPLIED_MARKER")"
+    printf '[%s] action=%s pane=%s slug=%s worktree=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" \
+      "start" \
+      "${DMUX_PANE_ID:-}" \
+      "${DMUX_SLUG:-}" \
+      "${DMUX_WORKTREE_PATH:-}" > "$APPLIED_MARKER"
+
     URL="$("$CLI" dev start --open)"
     PORT="$(echo "$URL" | sed -E 's#.*:([0-9]+)$#\1#')"
     STATUS_CMD="./clawdorio dev status --slug ${DMUX_SLUG:-<worktree-slug>}"
@@ -28,6 +37,7 @@ case "$ACTION" in
     ALIAS_WORKTREE="${DMUX_ROOT:-$(pwd)}/.dmux/worktrees/${ALIAS_NAME}"
 
     echo "[Hook] Clawdorio dev started at $URL (port $PORT)"
+    echo "[Hook] APPLIED marker: $APPLIED_MARKER"
     echo "[Hook] Alias branch: $ALIAS_NAME"
     echo "[Hook] Alias worktree: $ALIAS_WORKTREE"
     echo "[Hook] Check status: $STATUS_CMD"
@@ -47,6 +57,14 @@ case "$ACTION" in
     fi
     ;;
   stop)
+    mkdir -p "$(dirname "$APPLIED_MARKER")"
+    printf '[%s] action=%s pane=%s slug=%s worktree=%s\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" \
+      "stop" \
+      "${DMUX_PANE_ID:-}" \
+      "${DMUX_SLUG:-}" \
+      "${DMUX_WORKTREE_PATH:-}" > "$APPLIED_MARKER"
+
     "$CLI" dev stop
     echo "[Hook] Clawdorio dev stopped for slug ${DMUX_SLUG:-unknown}"
     ;;

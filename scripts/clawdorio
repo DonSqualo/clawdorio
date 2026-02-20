@@ -241,6 +241,12 @@ dev_command() {
     local alias_name="${slug}-p${port}"
 
     if git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local current_branch
+      current_branch="$(git -C "$worktree" branch --show-current 2>/dev/null || true)"
+      if [ -n "$current_branch" ] && [ "$current_branch" != "$alias_name" ]; then
+        # Rename the actual checked-out branch so the port is in the real branch name.
+        git -C "$worktree" branch -m "$alias_name" >/dev/null 2>&1 || true
+      fi
       git -C "$worktree" branch -f "$alias_name" HEAD >/dev/null 2>&1 || true
       echo "$alias_name" > "$alias_branch_file"
     fi
