@@ -77,6 +77,7 @@ Results are written to `event_log` (`auto_rebase.result`) and step/run status.
 - Base repo must be a valid git repo with `origin` configured.
 - Only branches associated with Clawdorio naming are auto-rebased.
 - Force push is done with `--force-with-lease` only.
+- Every PR description should include at least one screenshot showing the implemented UI/result.
 
 
 ## Mobile PR feed integration

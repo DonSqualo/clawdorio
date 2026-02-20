@@ -3924,7 +3924,7 @@ fn build_step_message(step: &PendingStep, repo: &str, branch: &str, pr_url: &str
             branch = branch
         ),
         "review" => format!(
-            "Review the PR.\n\nTASK:\n{task}\n\nPR: {pr}\n\nReply with:\nSTATUS: done\nREVIEW: ...\n",
+            "Review the PR.\n\nTASK:\n{task}\n\nPR: {pr}\n\nChecklist:\n- Verify code and tests\n- Verify PR includes at least one screenshot in the PR description\n\nReply with:\nSTATUS: done\nREVIEW: ...\n",
             task = step.task,
             pr = pr_url
         ),
@@ -4021,7 +4021,10 @@ fn create_pr(repo: &str, branch: &str, task: &str) -> anyhow::Result<String> {
     };
 
     let title = task.lines().next().unwrap_or("Clawdorio run").trim();
-    let body = format!("Clawdorio run for:\n\n{}", task);
+    let body = format!(
+        "Clawdorio run for:\n\n{task}\n\n## Screenshots (Required)\n- [ ] Add at least one screenshot showing the implemented result/UI.\n\n## Validation\n- [ ] Tests/build executed for this branch.",
+        task = task
+    );
     let pr = Command::new("gh")
         .arg("pr")
         .arg("create")
@@ -4513,19 +4516,18 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       padding:12px;
       box-shadow:0 18px 48px #0009;
       z-index:45;
-      display:grid;
-      grid-template-columns: 1fr 460px;
-      gap:12px;
+      display:flex;
+      align-items:stretch;
+      justify-content:center;
     }
-    .commandbar.detail{grid-template-columns: 1fr;}
     .commandbar.detail .palette-wrap{display:none;}
-    .commandbar.idle{grid-template-columns: 1fr;}
     .commandbar.idle .bottompanel{display:none;}
     .palette-wrap{
       display:flex;
       flex-direction:column;
       gap:10px;
       min-width:0;
+      width:100%;
       height:100%;
       max-width:min(860px, 100%);
       margin:0 auto;
@@ -4535,7 +4537,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       grid-template-columns:repeat(4, 1fr);
       grid-template-rows:repeat(2, 1fr);
       gap:10px;
-      overflow:hidden;
+      overflow:visible;
       padding:6px;
       border-radius:0;
       border:0;
@@ -4546,6 +4548,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }
     .palette-card{
       width:auto;
+      min-width:0;
       height:100%;
       flex:0 0 auto;
       border-radius:0;
@@ -4612,6 +4615,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       border-radius:0;border:1px solid #4f799f55;background:#061325aa;
       padding:10px;
       overflow:auto;
+      width:100%;
+      max-width:min(860px, 100%);
+      margin:0 auto;
     }
     .bottompanel .row{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted)}
     .bottompanel h3{
@@ -4821,6 +4827,97 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    let mobileTab = "base";
 	    let prFeedCards = [];
 	    const featureRunBusy = new Map();
+    const factoryRuntime = new Map();
+    let factoryPollInFlight = false;
+    let lastFactoryPollMs = 0;
+    let factoryPrHotspots = [];
+
+    function firstUrl(s){
+      const m = String(s || "").match(/https?:\/\/\S+/);
+      return m ? String(m[0]) : "";
+    }
+
+    function openUrl(url){
+      if (!url) return;
+      try{
+        window.open(url, "_blank", "noopener,noreferrer");
+      }catch(_e){}
+    }
+
+    function factoryRuntimeState(run, steps){
+      const list = Array.isArray(steps) ? steps : [];
+      const total = Math.max(1, list.length || 7);
+      const done = list.filter((s) => String(s.status || "") === "done").length;
+      const running = list.find((s) => String(s.status || "") === "running") || null;
+      const failed = list.find((s) => String(s.status || "") === "failed") || null;
+      const prStepDone = list.find((s) => String(s.step_id || "") === "pr" && String(s.status || "") === "done") || null;
+      const prUrl = firstUrl(prStepDone && prStepDone.output_text ? String(prStepDone.output_text) : "");
+
+      if (running){
+        const idx = Number(running.step_index || 0);
+        const wave = (Math.sin(performance.now() * 0.01) + 1) * 0.08;
+        const p = Math.min(0.98, Math.max(0.05, (idx + 0.25 + wave) / total));
+        return {
+          tone: "active",
+          color: "#ff9b3f",
+          progress: p,
+          label: `active ${String(running.step_id || "")}`,
+          prUrl,
+        };
+      }
+      if (String((run && run.status) || "") === "done"){
+        return { tone: "done", color: "#52e59c", progress: 1, label: "done", prUrl };
+      }
+      if (String((run && run.status) || "") === "failed" || failed){
+        const p = Math.max(0.08, done / total);
+        return { tone: "error", color: "#ff5f7a", progress: p, label: "error", prUrl };
+      }
+      if (String((run && run.status) || "") === "queued" || String((run && run.status) || "") === "running"){
+        const p = Math.max(0.04, done / total);
+        return { tone: "idle", color: "#8b95a6", progress: p, label: "queued", prUrl };
+      }
+      return { tone: "idle", color: "#8b95a6", progress: 0.04, label: "idle", prUrl };
+    }
+
+    async function refreshFactoryRuntime(force){
+      const now = Date.now();
+      if (!force && now - lastFactoryPollMs < 900) return;
+      if (factoryPollInFlight) return;
+      lastFactoryPollMs = now;
+      const features = placed.filter((e) => e && e.kind === "feature").map((e) => String(e.id || "")).filter(Boolean);
+      const keep = new Set(features);
+      [...factoryRuntime.keys()].forEach((id) => { if (!keep.has(id)) factoryRuntime.delete(id); });
+      if (!features.length){
+        requestDraw();
+        return;
+      }
+      factoryPollInFlight = true;
+      try{
+        const rows = await Promise.all(features.map(async (id) => {
+          try{
+            const runs = await fetchJson(`/api/runs?entity_id=${encodeURIComponent(id)}`);
+            if (!Array.isArray(runs) || !runs.length){
+              return [id, { tone: "idle", color: "#8b95a6", progress: 0.04, label: "idle", prUrl: "" }];
+            }
+            const run = runs[0];
+            const runId = String(run.id || "");
+            let steps = [];
+            try{
+              steps = await fetchJson(`/api/runs/${encodeURIComponent(runId)}/steps`);
+            }catch(_e){
+              steps = [];
+            }
+            return [id, factoryRuntimeState(run, steps)];
+          }catch(_e){
+            return [id, { tone: "error", color: "#ff5f7a", progress: 0.04, label: "offline", prUrl: "" }];
+          }
+        }));
+        rows.forEach(([id, st]) => factoryRuntime.set(String(id), st));
+      }finally{
+        factoryPollInFlight = false;
+      }
+      requestDraw();
+    }
 
 	    function showBaseModal(show){
 	      if (!baseCreateModalEl) return;
@@ -5131,10 +5228,10 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         if (mobileBuildDrawerEl) mobileBuildDrawerEl.style.display = "none";
         if (mobileRunsEl) mobileRunsEl.style.display = "none";
         if (questbookEl) questbookEl.classList.add("is-hidden");
-        if (commandbarEl) commandbarEl.style.display = "grid";
+        if (commandbarEl) commandbarEl.style.display = "flex";
         return;
       }
-      if (commandbarEl) commandbarEl.style.display = (mobileTab === "base") ? "grid" : "none";
+      if (commandbarEl) commandbarEl.style.display = (mobileTab === "base") ? "flex" : "none";
       if (mobileBuildDrawerEl) mobileBuildDrawerEl.style.display = (mobileTab === "build") ? "block" : "none";
       if (mobileRunsEl) mobileRunsEl.style.display = (mobileTab === "runs") ? "block" : "none";
       if (questbookEl) questbookEl.classList.toggle("is-hidden", mobileTab !== "quest");
@@ -5236,6 +5333,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             renderBottomPanel();
             requestDraw();
           }
+          refreshFactoryRuntime(false).catch(() => {});
         }catch(_e){
           // keep last known state
         }
@@ -5712,6 +5810,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
 	    function draw(){
 	      ctx.clearRect(0,0,w,h);
+      factoryPrHotspots = [];
 
       // Background: star tile pattern (Antfarm RTS asset) if available.
       if (!bgPattern){
@@ -5896,11 +5995,58 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             const ay = trim ? Number(trim.ay || (e.img.naturalHeight - 1)) : (e.img.naturalHeight - 1);
             const shiftX = (e.img.naturalWidth * 0.5 - ax) * scale;
             const shiftY = (e.img.naturalHeight - 1 - ay) * scale;
-            ctx.drawImage(e.img, pc.x - dw/2 + shiftX, pc.y - dh - 10*cam.z + shiftY, dw, dh);
+		            ctx.drawImage(e.img, pc.x - dw/2 + shiftX, pc.y - dh - 10*cam.z + shiftY, dw, dh);
 		          }else{
 		            // If sprites aren't ready yet, keep the world quiet (no placeholder text).
 		          }
 	        }
+
+        if (b.kind === "feature"){
+          const rt = factoryRuntime.get(String(b.id || "")) || { tone: "idle", color: "#8b95a6", progress: 0.04, label: "idle", prUrl: "" };
+          const anchor = worldToScreen(b.x + bw * 0.5, b.y + bh);
+          const bwPx = Math.max(56 * dpr, Math.min(128 * dpr, 92 * cam.z * dpr));
+          const bhPx = Math.max(6 * dpr, 8 * cam.z * dpr);
+          const x0 = Math.round(anchor.x - bwPx * 0.5);
+          const y0 = Math.round(anchor.y + 10 * cam.z * dpr);
+          const fillW = Math.max(1, Math.round(bwPx * Math.max(0, Math.min(1, Number(rt.progress || 0)))));
+          ctx.save();
+          ctx.fillStyle = "rgba(6,12,20,0.85)";
+          ctx.fillRect(x0, y0, bwPx, bhPx);
+          ctx.strokeStyle = "rgba(207,239,255,0.32)";
+          ctx.lineWidth = Math.max(1, 1 * dpr);
+          ctx.strokeRect(x0, y0, bwPx, bhPx);
+          ctx.fillStyle = String(rt.color || "#8b95a6");
+          ctx.fillRect(x0 + 1, y0 + 1, Math.max(1, fillW - 2), Math.max(1, bhPx - 2));
+          ctx.font = `${Math.max(9, Math.round(9 * cam.z)) * dpr}px Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.fillStyle = "rgba(220,242,255,0.92)";
+          ctx.fillText(String(rt.label || "idle"), Math.round(anchor.x), y0 - Math.max(2, 3 * dpr));
+
+          const prUrl = String(rt.prUrl || "");
+          if (prUrl){
+            const chipW = Math.max(140 * dpr, Math.min(300 * dpr, bwPx * 1.8));
+            const chipH = Math.max(16 * dpr, 20 * cam.z * dpr);
+            const anchorTop = worldToScreen(b.x + bw * 0.5, b.y);
+            const cx = Math.round(anchor.x - chipW * 0.5);
+            const cy = Math.round(anchorTop.y - chipH - Math.max(18 * dpr, 26 * cam.z * dpr));
+            ctx.fillStyle = "rgba(10,36,26,0.96)";
+            ctx.fillRect(cx, cy, chipW, chipH);
+            ctx.strokeStyle = "rgba(82,229,156,0.92)";
+            ctx.lineWidth = Math.max(1, 1 * dpr);
+            ctx.strokeRect(cx, cy, chipW, chipH);
+            ctx.textAlign = "left";
+            ctx.textBaseline = "middle";
+            ctx.fillStyle = "rgba(125,248,202,0.96)";
+            ctx.font = `${Math.max(9, Math.round(9 * cam.z)) * dpr}px Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace`;
+            const txt = `PR ready: ${prUrl}`;
+            const maxChars = Math.max(14, Math.floor((chipW / dpr - 18) / 6.6));
+            const shown = txt.length > maxChars ? `${txt.slice(0, maxChars - 1)}…` : txt;
+            ctx.fillText(shown, cx + 7 * dpr, cy + chipH * 0.5);
+            factoryPrHotspots.push({ x: cx, y: cy, w: chipW, h: chipH, url: prUrl });
+          }
+          ctx.restore();
+        }
 	      }
 
 	      // Draft overlay.
@@ -6017,6 +6163,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     canvas.addEventListener("mousemove", (e) => {
       state.mouse.x = e.clientX;
       state.mouse.y = e.clientY;
+      const rr = canvas.getBoundingClientRect();
+      const sxh = (e.clientX - rr.left) * dpr;
+      const syh = (e.clientY - rr.top) * dpr;
+      const overPr = factoryPrHotspots.some((h) => sxh >= h.x && sxh <= (h.x + h.w) && syh >= h.y && syh <= (h.y + h.h));
+      canvas.style.cursor = overPr ? "pointer" : "";
       if (state.drag.active){
         const r = canvas.getBoundingClientRect();
         const sx = (e.clientX - r.left) * dpr;
@@ -6133,6 +6284,14 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     }, { passive: false });
 
     canvas.addEventListener("click", (e) => {
+      const r0 = canvas.getBoundingClientRect();
+      const sxc = (e.clientX - r0.left) * dpr;
+      const syc = (e.clientY - r0.top) * dpr;
+      const hot = factoryPrHotspots.find((h) => sxc >= h.x && sxc <= (h.x + h.w) && syc >= h.y && syc <= (h.y + h.h)) || null;
+      if (hot && hot.url){
+        openUrl(String(hot.url));
+        return;
+      }
       if (!state.hover) return;
       if (baseCreateModalEl && baseCreateModalEl.style.display !== "none") return;
       if (featureBuildModalEl && featureBuildModalEl.style.display !== "none") return;
@@ -6608,14 +6767,33 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         }).join("");
 
         const prStep = (Array.isArray(steps) ? steps : []).find((s) => String(s.step_id) === "pr" && String(s.status) === "done") || null;
-        const prUrl = prStep && prStep.output_text ? String(prStep.output_text).trim() : "";
-        const prLine = prUrl ? `<div class="chip" style="margin-top:10px;">PR ${esc(prUrl)}</div>` : "";
+        const prUrlRaw = prStep && prStep.output_text ? String(prStep.output_text).trim() : "";
+        const prUrl = firstUrl(prUrlRaw);
+        const runStatus = String(run && run.status ? run.status : "");
+        const canComment = runStatus === "done" && !!run.id;
+        const prLine = prUrl
+          ? `<div style="margin-top:10px; border:1px solid #52e59c77; background:#0a241a; padding:8px;">
+              <div class="k" style="margin-bottom:6px;">PR</div>
+              <a href="${esc(prUrl)}" target="_blank" rel="noopener noreferrer" style="color:#7df8ca; word-break:break-all; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;">${esc(prUrl)}</a>
+            </div>`
+          : "";
+        const commentBox = canComment
+          ? `<div style="margin-top:10px; border-top:1px solid #4f799f55; padding-top:10px;">
+              <div class="k" style="margin-bottom:6px;">Comment for this branch/PR</div>
+              <textarea id="runCommentInput" rows="3" placeholder="Request changes for this run's branch and PR..." style="width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;"></textarea>
+              <div style="display:flex; gap:8px; margin-top:8px;">
+                <button id="runCommentSend" class="btn" type="button">Comment + Re-emit</button>
+                <div id="runCommentStatus" class="sub" style="margin:0; align-self:center;"></div>
+              </div>
+            </div>`
+          : "";
 
         runsEl.innerHTML = `
           <div class="row"><span>${esc(run.status || "")}</span><span>${esc(run.id || "")}</span></div>
           <div class="kanban" style="grid-template-columns:repeat(${cols},1fr); margin-top:10px;">${cards}</div>
           <div id="stepOut" style="margin-top:10px;"></div>
           ${prLine}
+          ${commentBox}
         `;
 
         const outEl = runsEl.querySelector("#stepOut");
@@ -6631,6 +6809,31 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
             renderKanban(run, steps);
           });
         });
+
+        const commentBtn = runsEl.querySelector("#runCommentSend");
+        const commentInput = runsEl.querySelector("#runCommentInput");
+        const commentStatus = runsEl.querySelector("#runCommentStatus");
+        if (commentBtn && commentInput){
+          commentBtn.addEventListener("click", async () => {
+            const comment = String(commentInput.value || "").trim();
+            if (!comment || !run || !run.id) return;
+            commentBtn.disabled = true;
+            if (commentStatus) commentStatus.textContent = "sending...";
+            try{
+              await fetchJson("/api/prs/comment", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ run_id: String(run.id), comment }),
+              });
+              commentInput.value = "";
+              if (commentStatus) commentStatus.textContent = "queued re-emit";
+              refreshRuns().catch(() => {});
+            }catch(_e){
+              if (commentStatus) commentStatus.textContent = "comment failed";
+            }
+            commentBtn.disabled = false;
+          });
+        }
       }
 
       async function refreshRuns(){
@@ -6695,6 +6898,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       renderQuestList();
       syncQuestEditor();
       applyState(st);
+      await refreshFactoryRuntime(true).catch(() => {});
     }catch(_e){
       // stay usable offline (palette might be empty)
     }
