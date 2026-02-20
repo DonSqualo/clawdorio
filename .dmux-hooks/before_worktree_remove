@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+"$HOOK_DIR/scripts/worktree_server.sh" stop

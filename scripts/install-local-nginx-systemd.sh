@@ -10,6 +10,7 @@ cargo build -p clawdorio-server --release
 echo "[clawdorio] installing binary to ~/.local/bin"
 install -d "$HOME/.local/bin"
 install -m 0755 "$repo_root/target/release/clawdorio-server" "$HOME/.local/bin/clawdorio-server"
+install -m 0755 "$repo_root/scripts/clawdorio" "$HOME/.local/bin/clawdorio"
 
 echo "[clawdorio] installing systemd user service"
 install -d "$HOME/.config/systemd/user"
@@ -34,4 +35,3 @@ Next (nginx):
   5) Verify: curl http://127.0.0.1:8787/health
 
 EOF
-

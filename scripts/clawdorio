@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  clawdorio dev <start|stop|restart|status|url|logs> [options]
+  clawdorio api <start|stop|restart|status|logs>
+
+Dev options:
+  --root <path>         Project root (default: $DMUX_ROOT or cwd)
+  --worktree <path>     Worktree path (default: $DMUX_WORKTREE_PATH or root/.dmux/worktrees/$DMUX_SLUG or root)
+  --pane-id <id>        Pane key (default: $DMUX_PANE_ID or $DMUX_SLUG or default)
+  --slug <slug>         Slug/worktree id fallback
+  --base-port <87xx>    Starting port within 8700..8799 (default: 8700)
+  --open                Try to open browser URL
+  --no-open             Do not open browser URL
+
+Examples:
+  scripts/clawdorio dev start --open
+  scripts/clawdorio dev stop
+  scripts/clawdorio dev status
+  scripts/clawdorio api restart
+USAGE
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+is_port_in_use() {
+  local port="$1"
+  if command_exists lsof; then
+    lsof -iTCP:"$port" -sTCP:LISTEN -Pn >/dev/null 2>&1
+    return $?
+  fi
+  if command_exists ss; then
+    ss -ltn | awk '{print $4}' | grep -Eq "[:.]${port}$"
+    return $?
+  fi
+  return 1
+}
+
+find_free_port() {
+  local start_port="$1"
+  local candidate="$start_port"
+  local tries=0
+
+  while [ "$tries" -lt 100 ]; do
+    if [ "$candidate" -gt 8799 ]; then
+      break
+    fi
+    if ! is_port_in_use "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+    tries=$((tries + 1))
+    candidate=$((candidate + 1))
+  done
+
+  return 1
+}
+
+get_tailscale_ip() {
+  if command_exists tailscale; then
+    tailscale ip -4 2>/dev/null | head -n1
+    return 0
+  fi
+  if command_exists ip; then
+    ip -4 addr show tailscale0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1
+    return 0
+  fi
+  return 0
+}
+
+open_url() {
+  local url="$1"
+  if command_exists xdg-open; then
+    nohup xdg-open "$url" >/dev/null 2>&1 &
+  elif command_exists open; then
+    nohup open "$url" >/dev/null 2>&1 &
+  elif command_exists wslview; then
+    nohup wslview "$url" >/dev/null 2>&1 &
+  fi
+}
+
+api_update_dev() {
+  local status="$1"
+  local pane_id="$2"
+  local server_port="${DMUX_SERVER_PORT:-}"
+  local url="${3:-}"
+
+  if [ -z "$server_port" ] || [ -z "$pane_id" ]; then
+    return 0
+  fi
+
+  local api="http://localhost:${server_port}/api/panes/${pane_id}/dev"
+  if [ -n "$url" ]; then
+    curl -sS -X PUT "$api" \
+      -H "Content-Type: application/json" \
+      -d "{\"status\":\"$status\",\"url\":\"$url\"}" >/dev/null || true
+  else
+    curl -sS -X PUT "$api" \
+      -H "Content-Type: application/json" \
+      -d "{\"status\":\"$status\"}" >/dev/null || true
+  fi
+}
+
+safe_key() {
+  local in="$1"
+  echo "$in" | tr '/ :\t' '____' | tr -cd '[:alnum:]_.-'
+}
+
+dev_command() {
+  local action="$1"
+  shift
+
+  local root="${DMUX_ROOT:-$(pwd)}"
+  local worktree="${DMUX_WORKTREE_PATH:-}"
+  local pane_id="${DMUX_PANE_ID:-}"
+  local slug="${DMUX_SLUG:-}"
+  local base_port="${DMUX_DEV_PORT_BASE:-8700}"
+  local should_open="0"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --root)
+        root="$2"
+        shift 2
+        ;;
+      --worktree)
+        worktree="$2"
+        shift 2
+        ;;
+      --pane-id)
+        pane_id="$2"
+        shift 2
+        ;;
+      --slug)
+        slug="$2"
+        shift 2
+        ;;
+      --base-port)
+        base_port="$2"
+        shift 2
+        ;;
+      --open)
+        should_open="1"
+        shift
+        ;;
+      --no-open)
+        should_open="0"
+        shift
+        ;;
+      *)
+        echo "Unknown dev option: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ -z "$worktree" ] && [ -n "$slug" ]; then
+    worktree="$root/.dmux/worktrees/$slug"
+  fi
+  if [ -z "$worktree" ]; then
+    worktree="$root"
+  fi
+
+  local pane_key="${pane_id:-${slug:-default}}"
+  pane_key="$(safe_key "$pane_key")"
+
+  if ! [[ "$base_port" =~ ^87[0-9][0-9]$ ]]; then
+    base_port=8700
+  fi
+
+  local state_dir="$root/.dmux-hooks/.runtime"
+  local hook_log="$root/.dmux/hooks.log"
+  local pid_file="$state_dir/$pane_key.pid"
+  local port_file="$state_dir/$pane_key.port"
+  local log_file="$state_dir/$pane_key.log"
+
+  mkdir -p "$state_dir" "$(dirname "$hook_log")"
+
+  log_hook() {
+    local msg="$1"
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$pane_key" "$msg" >> "$hook_log"
+  }
+
+  stop_dev() {
+    log_hook "stop requested"
+    if [ -f "$pid_file" ]; then
+      local pid
+      pid="$(cat "$pid_file")"
+      if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
+        sleep 1
+        kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
+    fi
+    rm -f "$pid_file" "$port_file"
+    api_update_dev "stopped" "$pane_id"
+    log_hook "stopped"
+    echo "stopped"
+  }
+
+  start_dev() {
+    log_hook "start requested"
+
+    local wait_tries=0
+    while [ ! -f "$worktree/package.json" ] && [ "$wait_tries" -lt 45 ]; do
+      sleep 1
+      wait_tries=$((wait_tries + 1))
+    done
+
+    if [ ! -f "$worktree/package.json" ]; then
+      log_hook "no package.json at $worktree; skipped"
+      echo "No package.json in $worktree" >&2
+      return 1
+    fi
+
+    stop_dev >/dev/null
+
+    cd "$worktree"
+
+    if [ ! -d node_modules ]; then
+      npm ci
+    fi
+
+    rm -rf node_modules/.vite
+
+    local port
+    port="$(find_free_port "$base_port")"
+    if [ -z "$port" ]; then
+      log_hook "failed: no available 87xx port from $base_port"
+      echo "No available 87xx port from $base_port" >&2
+      return 1
+    fi
+
+    nohup npm run dev -- --host 0.0.0.0 --port "$port" --strictPort --force >"$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    echo "$port" > "$port_file"
+
+    sleep 2
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      rm -f "$pid_file" "$port_file"
+      api_update_dev "stopped" "$pane_id"
+      log_hook "failed: dev server exited early (see $log_file)"
+      echo "Dev server failed to start. See $log_file" >&2
+      return 1
+    fi
+
+    local tailscale_ip
+    tailscale_ip="$(get_tailscale_ip)"
+    local url="http://127.0.0.1:${port}"
+    if [ -n "$tailscale_ip" ]; then
+      url="http://${tailscale_ip}:${port}"
+    fi
+
+    api_update_dev "running" "$pane_id" "$url"
+    if [ "$should_open" = "1" ]; then
+      open_url "$url"
+    fi
+
+    log_hook "running at $url (pid $pid, worktree $worktree)"
+    echo "$url"
+  }
+
+  status_dev() {
+    local pid=""
+    local port=""
+    if [ -f "$pid_file" ]; then pid="$(cat "$pid_file")"; fi
+    if [ -f "$port_file" ]; then port="$(cat "$port_file")"; fi
+
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      local tailscale_ip
+      tailscale_ip="$(get_tailscale_ip)"
+      local url="http://127.0.0.1:${port}"
+      if [ -n "$tailscale_ip" ] && [ -n "$port" ]; then
+        url="http://${tailscale_ip}:${port}"
+      fi
+      echo "running"
+      echo "pane_id=$pane_key"
+      echo "pid=$pid"
+      echo "worktree=$worktree"
+      echo "url=$url"
+      return 0
+    fi
+
+    echo "stopped"
+    echo "pane_id=$pane_key"
+    echo "worktree=$worktree"
+    return 1
+  }
+
+  logs_dev() {
+    tail -n 120 "$log_file" 2>/dev/null || true
+  }
+
+  url_dev() {
+    if [ ! -f "$port_file" ]; then
+      return 1
+    fi
+    local port
+    port="$(cat "$port_file")"
+    local tailscale_ip
+    tailscale_ip="$(get_tailscale_ip)"
+    if [ -n "$tailscale_ip" ]; then
+      echo "http://${tailscale_ip}:${port}"
+    else
+      echo "http://127.0.0.1:${port}"
+    fi
+  }
+
+  case "$action" in
+    start) start_dev ;;
+    stop) stop_dev ;;
+    restart) stop_dev >/dev/null; start_dev ;;
+    status) status_dev ;;
+    logs) logs_dev ;;
+    url) url_dev ;;
+    *)
+      echo "Unknown dev action: $action" >&2
+      exit 1
+      ;;
+  esac
+}
+
+api_command() {
+  local action="$1"
+  if ! command_exists systemctl; then
+    echo "systemctl not found" >&2
+    exit 1
+  fi
+
+  case "$action" in
+    start|stop|restart|status)
+      systemctl --user "$action" clawdorio.service
+      ;;
+    logs)
+      journalctl --user -u clawdorio.service -n 150 --no-pager
+      ;;
+    *)
+      echo "Unknown api action: $action" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main() {
+  local group="${1:-}"
+  if [ -z "$group" ] || [ "$group" = "help" ] || [ "$group" = "--help" ] || [ "$group" = "-h" ]; then
+    usage
+    exit 0
+  fi
+  shift
+
+  case "$group" in
+    dev)
+      if [ "$#" -lt 1 ]; then
+        usage
+        exit 1
+      fi
+      local action="$1"
+      shift
+      dev_command "$action" "$@"
+      ;;
+    api)
+      if [ "$#" -lt 1 ]; then
+        usage
+        exit 1
+      fi
+      local action="$1"
+      shift
+      api_command "$action"
+      ;;
+    *)
+      echo "Unknown command group: $group" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

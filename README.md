@@ -35,6 +35,29 @@ curl http://127.0.0.1:39333/health
 cargo run -p clawdorio-server -- --host 0.0.0.0 --port 39333
 ```
 
+## Clawdorio CLI
+
+Unified local control script:
+
+```bash
+scripts/clawdorio dev start --open
+scripts/clawdorio dev stop
+scripts/clawdorio dev status
+scripts/clawdorio dev logs
+```
+
+Systemd-managed headless API:
+
+```bash
+scripts/clawdorio api start
+scripts/clawdorio api stop
+scripts/clawdorio api restart
+scripts/clawdorio api status
+scripts/clawdorio api logs
+```
+
+`dmux` hooks in `.dmux-hooks/` call this CLI for startup/teardown, so lifecycle behavior stays consistent.
+
 ## Desktop dev (Tauri)
 
 ```bash
