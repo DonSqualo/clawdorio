@@ -166,8 +166,15 @@ dev_command() {
     worktree="$root"
   fi
 
-  local pane_key="${pane_id:-${slug:-default}}"
-  pane_key="$(safe_key "$pane_key")"
+  local instance_key="${slug:-}"
+  if [ -z "$instance_key" ]; then
+    instance_key="$(basename "$worktree")"
+  fi
+  if [ -z "$instance_key" ] || [ "$instance_key" = "." ] || [ "$instance_key" = "/" ]; then
+    instance_key="${pane_id:-default}"
+  fi
+  instance_key="$(safe_key "$instance_key")"
+  local pane_key="${pane_id:-$instance_key}"
 
   if ! [[ "$base_port" =~ ^87[0-9][0-9]$ ]]; then
     base_port=8700
@@ -175,15 +182,52 @@ dev_command() {
 
   local state_dir="$root/.dmux-hooks/.runtime"
   local hook_log="$root/.dmux/hooks.log"
-  local pid_file="$state_dir/$pane_key.pid"
-  local port_file="$state_dir/$pane_key.port"
-  local log_file="$state_dir/$pane_key.log"
+  local pid_file="$state_dir/$instance_key.pid"
+  local port_file="$state_dir/$instance_key.port"
+  local log_file="$state_dir/$instance_key.log"
+  local lock_dir="$state_dir/$instance_key.lock"
 
   mkdir -p "$state_dir" "$(dirname "$hook_log")"
 
   log_hook() {
     local msg="$1"
     printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$pane_key" "$msg" >> "$hook_log"
+  }
+
+  acquire_lock() {
+    local attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -gt 400 ]; then
+        log_hook "failed: lock timeout for $instance_key"
+        echo "Timed out waiting for lock ($instance_key)" >&2
+        return 1
+      fi
+      sleep 0.1
+    done
+  }
+
+  release_lock() {
+    rmdir "$lock_dir" >/dev/null 2>&1 || true
+  }
+
+  with_lock() {
+    local rc=0
+    acquire_lock || return 1
+    "$@" || rc=$?
+    release_lock
+    return "$rc"
+  }
+
+  url_for_port() {
+    local port="$1"
+    local tailscale_ip
+    tailscale_ip="$(get_tailscale_ip)"
+    if [ -n "$tailscale_ip" ]; then
+      echo "http://${tailscale_ip}:${port}"
+    else
+      echo "http://127.0.0.1:${port}"
+    fi
   }
 
   stop_dev() {
@@ -218,6 +262,22 @@ dev_command() {
       return 1
     fi
 
+    local running_pid=""
+    local running_port=""
+    if [ -f "$pid_file" ]; then running_pid="$(cat "$pid_file")"; fi
+    if [ -f "$port_file" ]; then running_port="$(cat "$port_file")"; fi
+    if [ -n "$running_pid" ] && [ -n "$running_port" ] && kill -0 "$running_pid" >/dev/null 2>&1; then
+      local existing_url
+      existing_url="$(url_for_port "$running_port")"
+      api_update_dev "running" "$pane_id" "$existing_url"
+      if [ "$should_open" = "1" ]; then
+        open_url "$existing_url"
+      fi
+      log_hook "already running at $existing_url (pid $running_pid, worktree $worktree)"
+      echo "$existing_url"
+      return 0
+    fi
+
     stop_dev >/dev/null
 
     cd "$worktree"
@@ -250,12 +310,8 @@ dev_command() {
       return 1
     fi
 
-    local tailscale_ip
-    tailscale_ip="$(get_tailscale_ip)"
-    local url="http://127.0.0.1:${port}"
-    if [ -n "$tailscale_ip" ]; then
-      url="http://${tailscale_ip}:${port}"
-    fi
+    local url
+    url="$(url_for_port "$port")"
 
     api_update_dev "running" "$pane_id" "$url"
     if [ "$should_open" = "1" ]; then
@@ -274,13 +330,13 @@ dev_command() {
 
     if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
       local tailscale_ip
-      tailscale_ip="$(get_tailscale_ip)"
-      local url="http://127.0.0.1:${port}"
-      if [ -n "$tailscale_ip" ] && [ -n "$port" ]; then
-        url="http://${tailscale_ip}:${port}"
+      local url=""
+      if [ -n "$port" ]; then
+        url="$(url_for_port "$port")"
       fi
       echo "running"
       echo "pane_id=$pane_key"
+      echo "instance_key=$instance_key"
       echo "pid=$pid"
       echo "worktree=$worktree"
       echo "url=$url"
@@ -289,6 +345,7 @@ dev_command() {
 
     echo "stopped"
     echo "pane_id=$pane_key"
+    echo "instance_key=$instance_key"
     echo "worktree=$worktree"
     return 1
   }
@@ -303,19 +360,13 @@ dev_command() {
     fi
     local port
     port="$(cat "$port_file")"
-    local tailscale_ip
-    tailscale_ip="$(get_tailscale_ip)"
-    if [ -n "$tailscale_ip" ]; then
-      echo "http://${tailscale_ip}:${port}"
-    else
-      echo "http://127.0.0.1:${port}"
-    fi
+    url_for_port "$port"
   }
 
   case "$action" in
-    start) start_dev ;;
-    stop) stop_dev ;;
-    restart) stop_dev >/dev/null; start_dev ;;
+    start) with_lock start_dev ;;
+    stop) with_lock stop_dev ;;
+    restart) with_lock stop_dev >/dev/null; with_lock start_dev ;;
     status) status_dev ;;
     logs) logs_dev ;;
     url) url_dev ;;
