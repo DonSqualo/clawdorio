@@ -34,3 +34,4 @@ visual-artifacts/*
 crates/server/assets/rts-sprites/*-20260217c.webp
 crates/server/assets/rts-sprites/*-20260217d.webp
 crates/server/assets/rts-sprites/*-20260217e.webp
+.dmux/
