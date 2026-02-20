@@ -8,11 +8,14 @@ if [ -z "$ACTION" ]; then
 fi
 
 ROOT="${DMUX_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-CLI="$ROOT/scripts/clawdorio"
+CLI="$ROOT/clawdorio"
 
 if [ ! -x "$CLI" ]; then
-  echo "[Hook] Missing executable CLI: $CLI" >&2
-  exit 1
+  CLI="$ROOT/scripts/clawdorio"
+  if [ ! -x "$CLI" ]; then
+    echo "[Hook] Missing executable CLI: $ROOT/clawdorio or $ROOT/scripts/clawdorio" >&2
+    exit 1
+  fi
 fi
 
 case "$ACTION" in
