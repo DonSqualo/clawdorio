@@ -4757,6 +4757,17 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	        <button id="baseCreatePlace" class="btn" type="button">Place</button>
 	      </div>
 	    </div>
+	    <div id="featureBuildModal" style="display:none; position:absolute; left:var(--screen-pad); right:var(--screen-pad); bottom:calc(var(--screen-pad) + var(--command-h) + 12px); z-index:81; border:0; background:#081427f0; padding:12px; box-shadow:0 18px 48px #000b;">
+	      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
+	        <div style="font-family:Orbitron,system-ui,sans-serif; font-size:12px; letter-spacing:.6px;">Feature Build Prompt</div>
+	        <button id="featureBuildCancel" class="btn" type="button">Cancel</button>
+	      </div>
+	      <textarea id="featureBuildPrompt" rows="6" style="width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;"></textarea>
+	      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:10px;">
+	        <input id="featureBuildStatus" readonly placeholder="idle" style="flex:1; border:1px solid #4f799f; background:#081427; color:var(--muted); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;" />
+	        <button id="featureBuildConfirm" class="btn" type="button">Confirm</button>
+	      </div>
+	    </div>
 	  </div>
 
   <script>
@@ -4786,6 +4797,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    const baseRepoSelectEl = $("baseRepoSelect");
 	    const baseCreatePlaceEl = $("baseCreatePlace");
 	    const baseCreateCancelEl = $("baseCreateCancel");
+	    const featureBuildModalEl = $("featureBuildModal");
+	    const featureBuildPromptEl = $("featureBuildPrompt");
+	    const featureBuildStatusEl = $("featureBuildStatus");
+	    const featureBuildConfirmEl = $("featureBuildConfirm");
+	    const featureBuildCancelEl = $("featureBuildCancel");
 
     // Pulled from Antfarm RTS palette/specs via the Rust API, so UI never diverges.
     let BUILDINGS = [];
@@ -4798,15 +4814,67 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	    let questDirty = false;
 	    let localRepos = [];
 	    let pendingBasePlacement = null;
+	    let pendingFeatureBuild = null;
 	    let belts = [];
 	    let selectedBeltId = null;
 	    let beltOcc = new Set(); // "x,y" occupied by belt segments (1x1 cells)
 	    let mobileTab = "base";
 	    let prFeedCards = [];
+	    const featureRunBusy = new Map();
 
 	    function showBaseModal(show){
 	      if (!baseCreateModalEl) return;
 	      baseCreateModalEl.style.display = show ? "block" : "none";
+	    }
+
+	    function showFeatureBuildModal(show){
+	      if (!featureBuildModalEl) return;
+	      featureBuildModalEl.style.display = show ? "block" : "none";
+	    }
+
+	    function setFeatureBuildBusy(entityId, busy, statusText){
+	      if (!entityId) return;
+	      featureRunBusy.set(String(entityId), !!busy);
+	      const active = pendingFeatureBuild && String(pendingFeatureBuild.entityId || "") === String(entityId);
+	      if (!active) return;
+	      if (featureBuildPromptEl) featureBuildPromptEl.readOnly = !!busy;
+	      if (featureBuildConfirmEl) featureBuildConfirmEl.disabled = !!busy;
+	      if (featureBuildStatusEl) featureBuildStatusEl.value = String(statusText || (busy ? "working" : ""));
+	    }
+
+	    async function runFeatureBuild(entityId, prompt){
+	      return fetchJson("/api/feature/build", {
+	        method: "POST",
+	        headers: { "content-type": "application/json" },
+	        body: JSON.stringify({ entity_id: String(entityId), prompt: String(prompt) }),
+	      });
+	    }
+
+	    function openFeatureBuildModal(entityId, opts){
+	      const id = String(entityId || "");
+	      if (!id) return;
+	      pendingFeatureBuild = { entityId: id, deleteOnCancel: !!(opts && opts.deleteOnCancel) };
+	      const draft = String(featureDraft.get(id) || "");
+	      const busy = !!featureRunBusy.get(id);
+	      if (featureBuildPromptEl){
+	        featureBuildPromptEl.value = draft;
+	        featureBuildPromptEl.readOnly = busy;
+	      }
+	      if (featureBuildConfirmEl) featureBuildConfirmEl.disabled = busy;
+	      if (featureBuildStatusEl) featureBuildStatusEl.value = busy ? "working" : "";
+	      showFeatureBuildModal(true);
+	      if (featureBuildPromptEl && !busy) featureBuildPromptEl.focus();
+	    }
+
+	    async function cancelFeatureBuildFlow(){
+	      const pending = pendingFeatureBuild;
+	      pendingFeatureBuild = null;
+	      showFeatureBuildModal(false);
+	      if (!pending || !pending.deleteOnCancel) return;
+	      const id = String(pending.entityId || "");
+	      if (!id || featureRunBusy.get(id)) return;
+	      if (!placed.some((e) => String(e.id) === id)) return;
+	      await deleteEntityById(id);
 	    }
 
 	    function syncBaseRepoSelect(){
@@ -4855,6 +4923,29 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 	          pendingBasePlacement = null;
 	          showBaseModal(false);
 	        }catch(_e){}
+	      });
+	    }
+	    if (featureBuildCancelEl){
+	      featureBuildCancelEl.addEventListener("click", () => {
+	        cancelFeatureBuildFlow().catch(() => {});
+	      });
+	    }
+	    if (featureBuildConfirmEl){
+	      featureBuildConfirmEl.addEventListener("click", async () => {
+	        const pending = pendingFeatureBuild;
+	        const id = String(pending && pending.entityId ? pending.entityId : "");
+	        const prompt = featureBuildPromptEl ? String(featureBuildPromptEl.value || "") : "";
+	        if (!id || !prompt.trim()) return;
+	        featureDraft.set(id, prompt);
+	        setFeatureBuildBusy(id, true, "starting");
+	        try{
+	          const res = await runFeatureBuild(id, prompt);
+	          const runId = String(res && res.run_id ? res.run_id : "");
+	          setFeatureBuildBusy(id, true, runId ? `run ${runId}` : "working");
+	          if (selected && String(selected.id || "") === id) renderBottomPanel();
+	        }catch(_e){
+	          setFeatureBuildBusy(id, false, "start failed");
+	        }
 	      });
 	    }
 
@@ -6044,6 +6135,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     canvas.addEventListener("click", (e) => {
       if (!state.hover) return;
       if (baseCreateModalEl && baseCreateModalEl.style.display !== "none") return;
+      if (featureBuildModalEl && featureBuildModalEl.style.display !== "none") return;
       if (state.drag && state.drag.active) return;
       if (state.drag && state.drag.moved) return;
 
@@ -6057,7 +6149,12 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
           draftKind = null;
           updatePaletteActive();
         } else {
-          createEntity(draftKind, state.hover.x, state.hover.y).catch(() => {});
+          const kind = draftKind;
+          createEntity(kind, state.hover.x, state.hover.y)
+            .then((ent) => {
+              if (kind === "feature") openFeatureBuildModal(String(ent.id || ""), { deleteOnCancel: true });
+            })
+            .catch(() => {});
         }
         return;
       }
@@ -6102,6 +6199,7 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
     canvas.addEventListener("drop", (e) => {
       e.preventDefault();
       if (!state.hover) return;
+      if (featureBuildModalEl && featureBuildModalEl.style.display !== "none") return;
       const kind = (e.dataTransfer && e.dataTransfer.getData("text/plain")) ? e.dataTransfer.getData("text/plain") : draftKind;
       if (!buildingSpec(kind)) return;
       draftKind = kind;
@@ -6113,7 +6211,11 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
         if (baseRepoSelectEl) baseRepoSelectEl.focus();
         return;
       }
-      createEntity(kind, state.hover.x, state.hover.y).catch(() => {});
+      createEntity(kind, state.hover.x, state.hover.y)
+        .then((ent) => {
+          if (kind === "feature") openFeatureBuildModal(String(ent.id || ""), { deleteOnCancel: true });
+        })
+        .catch(() => {});
     });
 
     window.addEventListener("resize", () => { resize(); applyMobileTab(); });
@@ -6133,6 +6235,10 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       const up = key.length === 1 ? key.toUpperCase() : key;
 
       if (up === "Escape"){
+        if (featureBuildModalEl && featureBuildModalEl.style.display !== "none"){
+          cancelFeatureBuildFlow().catch(() => {});
+          return;
+        }
         if (baseCreateModalEl && baseCreateModalEl.style.display !== "none"){
           pendingBasePlacement = null;
           showBaseModal(false);
@@ -6447,21 +6553,26 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
 
       const key = String(selected.id || "");
       const prev = featureDraft.get(key) || "";
+      const knownBusy = !!featureRunBusy.get(key);
       refreshPrFeed();
       body.innerHTML = `
-        <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
-          <textarea id="featurePrompt" rows="4" style="flex:1; width:100%; resize:vertical; border:1px solid #4f799f; background:#0b1b30; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;">${esc(prev)}</textarea>
-          <button id="featureBuildBtn" class="btn" type="button" style="white-space:nowrap;">Build</button>
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:10px;">
+          <input readonly value="${esc(String(prev))}" placeholder="prompt..." style="flex:1; width:100%; border:1px solid #4f799f; background:#081427; color:var(--ice); padding:8px 10px; font-family:Geist Mono, ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;" />
+          <button id="featureOpenBuildModalBtn" class="btn" type="button" style="white-space:nowrap;">${knownBusy ? "Working" : "Build"}</button>
         </div>
         <div id="featureBuildResult" class="sub"></div>
         <div id="featureRuns" style="margin-top:10px;"></div>
       `;
 
-      const ta = bottomPanel.querySelector("#featurePrompt");
-      const btn = bottomPanel.querySelector("#featureBuildBtn");
+      const openBtn = bottomPanel.querySelector("#featureOpenBuildModalBtn");
       const out = bottomPanel.querySelector("#featureBuildResult");
       const runsEl = bottomPanel.querySelector("#featureRuns");
       let activeStepRowId = null;
+      if (out && knownBusy) out.textContent = "working";
+      if (openBtn){
+        openBtn.disabled = knownBusy;
+        openBtn.addEventListener("click", () => openFeatureBuildModal(key, { deleteOnCancel: false }));
+      }
 
       function stepLabel(s){
         const m = {
@@ -6528,10 +6639,18 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
           const runs = await fetchJson(`/api/runs?entity_id=${encodeURIComponent(key)}`);
           if (!Array.isArray(runs) || !runs.length){
             runsEl.innerHTML = "";
+            featureRunBusy.set(key, false);
+            if (out) out.textContent = "";
+            setFeatureBuildBusy(key, false, "");
             return;
           }
           const run = runs[0];
+          const runStatus = String(run && run.status ? run.status : "");
+          const busy = runStatus === "queued" || runStatus === "running";
+          featureRunBusy.set(key, busy);
+          if (out) out.textContent = busy ? "working" : String(run.id || "");
           const steps = await fetchJson(`/api/runs/${encodeURIComponent(String(run.id))}/steps`);
+          setFeatureBuildBusy(key, busy, busy ? `run ${String(run.id || "")}` : String(run.id || ""));
           // Default output panel to the running step.
           if (!activeStepRowId){
             const running = Array.isArray(steps) ? steps.find((s) => String(s.status) === "running") : null;
@@ -6540,6 +6659,9 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
           renderKanban(run, steps);
         }catch(_e){
           runsEl.innerHTML = "";
+          featureRunBusy.set(key, false);
+          if (out) out.textContent = "";
+          setFeatureBuildBusy(key, false, "");
         }
       }
 
@@ -6555,27 +6677,6 @@ const DASHBOARD_HTML: &str = r###"<!doctype html>
       });
       mo.observe(document.body, { childList: true, subtree: true });
 
-      if (ta){
-        ta.addEventListener("input", () => featureDraft.set(key, ta.value));
-      }
-      if (btn){
-        btn.addEventListener("click", async () => {
-          const prompt = ta ? ta.value : "";
-          if (!prompt.trim()) return;
-          if (out) out.textContent = "building";
-          try{
-            const res = await fetchJson("/api/feature/build", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ entity_id: key, prompt }),
-            });
-            if (out) out.textContent = String(res.run_id || "");
-            refreshRuns();
-          }catch(_e){
-            if (out) out.textContent = "";
-          }
-        });
-      }
     }
 
     try{
