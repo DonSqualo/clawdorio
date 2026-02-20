@@ -1,5 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+DMUX_HOOK_NAME="pane_closed" "$HOOK_DIR/scripts/hook_proof.sh"
 "$HOOK_DIR/scripts/worktree_server.sh" stop

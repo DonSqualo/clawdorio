@@ -1,0 +1,4 @@
+#!/bin/bash
+set -euo pipefail
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+DMUX_HOOK_NAME="before_pane_create" "$HOOK_DIR/scripts/hook_proof.sh"
