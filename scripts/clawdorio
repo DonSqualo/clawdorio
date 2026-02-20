@@ -186,6 +186,8 @@ dev_command() {
   local port_file="$state_dir/$instance_key.port"
   local log_file="$state_dir/$instance_key.log"
   local lock_dir="$state_dir/$instance_key.lock"
+  local alias_path_file="$state_dir/$instance_key.alias_path"
+  local alias_branch_file="$state_dir/$instance_key.alias_branch"
 
   mkdir -p "$state_dir" "$(dirname "$hook_log")"
 
@@ -230,6 +232,47 @@ dev_command() {
     fi
   }
 
+  set_runtime_aliases() {
+    local port="$1"
+    if [ -z "$slug" ]; then
+      return 0
+    fi
+
+    local alias_name="${slug}-p${port}"
+
+    if git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      git -C "$worktree" branch -f "$alias_name" HEAD >/dev/null 2>&1 || true
+      echo "$alias_name" > "$alias_branch_file"
+    fi
+
+    local wt_parent="$root/.dmux/worktrees"
+    if [ -d "$wt_parent" ] && [ -d "$worktree" ]; then
+      if [ -f "$alias_path_file" ]; then
+        local old_alias_path
+        old_alias_path="$(cat "$alias_path_file")"
+        if [ -L "$old_alias_path" ]; then
+          rm -f "$old_alias_path"
+        fi
+      fi
+
+      local alias_path="$wt_parent/$alias_name"
+      rm -f "$alias_path" >/dev/null 2>&1 || true
+      ln -s "$worktree" "$alias_path" >/dev/null 2>&1 || true
+      echo "$alias_path" > "$alias_path_file"
+    fi
+  }
+
+  clear_runtime_aliases() {
+    if [ -f "$alias_path_file" ]; then
+      local alias_path
+      alias_path="$(cat "$alias_path_file")"
+      if [ -L "$alias_path" ]; then
+        rm -f "$alias_path"
+      fi
+    fi
+    rm -f "$alias_path_file" "$alias_branch_file"
+  }
+
   stop_dev() {
     log_hook "stop requested"
     if [ -f "$pid_file" ]; then
@@ -242,6 +285,7 @@ dev_command() {
       fi
     fi
     rm -f "$pid_file" "$port_file"
+    clear_runtime_aliases
     api_update_dev "stopped" "$pane_id"
     log_hook "stopped"
     echo "stopped"
@@ -312,6 +356,7 @@ dev_command() {
 
     local url
     url="$(url_for_port "$port")"
+    set_runtime_aliases "$port"
 
     api_update_dev "running" "$pane_id" "$url"
     if [ "$should_open" = "1" ]; then
