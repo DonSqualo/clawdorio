@@ -44,7 +44,11 @@ case "$ACTION" in
   start)
     write_applied_marker "start"
 
-    URL="$("$CLI" dev start --open)"
+    if [ "${DMUX_OPEN_BROWSER:-0}" = "1" ]; then
+      URL="$("$CLI" dev start --open)"
+    else
+      URL="$("$CLI" dev start --no-open)"
+    fi
     PORT="$(echo "$URL" | sed -E 's#.*:([0-9]+)$#\1#')"
     STATUS_CMD="./clawdorio dev status --slug ${DMUX_SLUG:-<worktree-slug>}"
     URL_CMD="./clawdorio dev url --slug ${DMUX_SLUG:-<worktree-slug>}"
@@ -61,6 +65,8 @@ case "$ACTION" in
     echo "[Hook] Get URL: $URL_CMD"
 
     if command -v tmux >/dev/null 2>&1 && [ -n "${DMUX_TMUX_PANE_ID:-}" ]; then
+      tmux select-pane -t "$DMUX_TMUX_PANE_ID" -T "$ALIAS_NAME" >/dev/null 2>&1 || true
+      tmux rename-window -t "$DMUX_TMUX_PANE_ID" "$ALIAS_NAME" >/dev/null 2>&1 || true
       tmux send-keys -t "$DMUX_TMUX_PANE_ID" \
         "echo '[dmux hook] clawdorio dev: $URL (port $PORT)'" C-m
       tmux send-keys -t "$DMUX_TMUX_PANE_ID" \

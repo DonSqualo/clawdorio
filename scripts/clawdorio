@@ -317,6 +317,7 @@ dev_command() {
     if [ -f "$pid_file" ]; then running_pid="$(cat "$pid_file")"; fi
     if [ -f "$port_file" ]; then running_port="$(cat "$port_file")"; fi
     if [ -n "$running_pid" ] && [ -n "$running_port" ] && kill -0 "$running_pid" >/dev/null 2>&1; then
+      set_runtime_aliases "$running_port"
       local existing_url
       existing_url="$(url_for_port "$running_port")"
       api_update_dev "running" "$pane_id" "$existing_url"
